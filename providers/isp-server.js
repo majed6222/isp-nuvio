@@ -35,6 +35,8 @@ function http(url) {
       return r.text();
     })
     .catch(function (e) { DBG.lastErr = String(e && e.message ? e.message : e); return null; });
+    // Nuvio's JS engine may not have setTimeout, so the timeout is only used when it exists
+  if (typeof setTimeout !== 'function') return req;
   var timeout = new Promise(function (resolve) {
     setTimeout(function () { resolve(null); }, CONFIG.timeoutMs);
   });
