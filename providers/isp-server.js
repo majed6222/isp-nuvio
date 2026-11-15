@@ -4,13 +4,19 @@ var CONFIG = {
       paths: { movie: ['Movies/'], tv: ['Tv_Shows/'] } }
   ],
   tmdbApiKey: '18c5a939865f2d093d1bcda9b234b58b',
-  authHeader: '',
+  authHeader: '',    
   maxRequests: 60,
   maxDepth: 4,
-  timeoutMs: 8000
+  timeoutMs: 8000,
+  debug: true         // when nothing is found, show an "ISP DEBUG" source that says why
 };
 
 var VIDEO_RE = /\.(mkv|mp4|avi|webm|m3u8|ts|mov)(\?.*)?$/i;
+var DBG = { tmdb: '', pages: 0, ok: 0, lastErr: '' };
+
+function debugStream(msg) {
+  return [{ name: 'ISP DEBUG', title: msg, url: 'http://127.0.0.1/debug', quality: 'Unknown', provider: 'isp-local' }];
+}
 
 function norm(s) {
   return String(s || '').toLowerCase().replace(/&amp;|&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').replace(/^ | $/g, '');
@@ -19,9 +25,14 @@ function norm(s) {
 function http(url) {
   var headers = { 'User-Agent': 'Mozilla/5.0' };
   if (CONFIG.authHeader) headers['Authorization'] = CONFIG.authHeader;
+  DBG.pages++;
   var req = fetch(url, { headers: headers })
-    .then(function (r) { return r.ok ? r.text() : null; })
-    .catch(function () { return null; });
+    .then(function (r) {
+      if (!r.ok) { DBG.lastErr = 'HTTP ' + r.status; return null; }
+      DBG.ok++;
+      return r.text();
+    })
+    .catch(function (e) { DBG.lastErr = String(e && e.message ? e.message : e); return null; });
   var timeout = new Promise(function (resolve) {
     setTimeout(function () { resolve(null); }, CONFIG.timeoutMs);
   });
@@ -35,11 +46,13 @@ function tmdbInfo(id, mediaType) {
   return fetch('https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + key)
     .then(function (r) { return r.json(); })
     .then(function (j) {
+      if (!j || (!j.title && !j.name)) throw new Error('TMDB: ' + (j && j.status_message ? j.status_message : 'no data'));
       var titles = [];
       [j.title, j.name, j.original_title, j.original_name].forEach(function (t) {
         if (t && titles.indexOf(t) < 0) titles.push(t);
       });
       var year = String(j.release_date || j.first_air_date || '').slice(0, 4);
+      DBG.tmdb = titles[0] + ' ' + year;
       return { titles: titles, year: year, isTv: kind === 'tv' };
     });
 }
@@ -166,6 +179,7 @@ function decodeURIComponent_safe(u) {
 }
 
 function getStreams(tmdbId, mediaType, season, episode) {
+  DBG = { tmdb: '', pages: 0, ok: 0, lastErr: '' };
   return tmdbInfo(tmdbId, mediaType).then(function (info) {
     var results = [], seen = {};
     var chain = Promise.resolve();
@@ -188,10 +202,15 @@ function getStreams(tmdbId, mediaType, season, episode) {
         });
       });
     });
-    return chain.then(function () { return results.slice(0, 12); });
+    return chain.then(function () {
+      if (!results.length && CONFIG.debug) {
+        return debugStream('Nothing found. TMDB: ' + DBG.tmdb + ' | server pages ok ' + DBG.ok + '/' + DBG.pages + (DBG.lastErr ? ' | last error: ' + DBG.lastErr : ''));
+      }
+      return results.slice(0, 12);
+    });
   }).catch(function (err) {
     if (typeof console !== 'undefined') console.log('[isp-local] ' + (err && err.message ? err.message : err));
-    return [];
+    return CONFIG.debug ? debugStream('Error: ' + (err && err.message ? err.message : err)) : [];
   });
 }
 
