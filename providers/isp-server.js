@@ -159,7 +159,8 @@ function crawl(server, info, mediaType, season, episode) {
         var matched = titleMatches(l.text, info) || titleMatches(decodeURIComponent_safe(l.url.split('?')[0].split('/').filter(Boolean).pop() || ''), info);
         var next = { url: l.url, depth: job.depth + 1, inMatch: job.inMatch || matched };
         var yearHit = !info.isTv && info.year && norm(l.text) === info.year;
-        if (matched) queue.unshift(next); else if (yearHit) queue.unshift(next); else queue.push(next);
+                // folders inside a matching folder (e.g. "Season 1") go first, so unrelated folders never use up the page limit
+        if (matched || job.inMatch) queue.unshift(next); else if (yearHit) queue.unshift(next); else queue.push(next);
       }
     }
   }
@@ -167,6 +168,7 @@ function crawl(server, info, mediaType, season, episode) {
   function step() {
     if (!queue.length || budget <= 0 || found.length >= 10) return Promise.resolve(found);
     var job = queue.shift();
+    if (found.length && !job.inMatch) return step();   // already found something: only finish the matching folders
     if (visited[job.url]) return step();
     visited[job.url] = true;
     budget--;
