@@ -15,7 +15,9 @@ var VIDEO_RE = /\.(mkv|mp4|avi|webm|m3u8|ts|mov)(\?.*)?$/i;
 var DBG = { tmdb: '', pages: 0, ok: 0, lastErr: '' };
 
 function debugStream(msg) {
-  return [{ name: 'ISP DEBUG', title: msg, url: 'http://127.0.0.1/debug', quality: 'Unknown', provider: 'isp-local' }];
+  return String(msg).split(' | ').map(function (part, i) {
+    return { name: 'ISP DEBUG ' + (i + 1) + ': ' + part, title: part, url: 'http://127.0.0.1/debug' + (i + 1), quality: 'Unknown', provider: 'isp-local' };
+  });
 }
 
 function norm(s) {
