@@ -3,12 +3,13 @@ var CONFIG = {
     { name: 'Server1', base: 'http://server1.dhakamovie.com/', searchUrl: '',
       paths: { movie: ['Movies/'], tv: ['Tv_Shows/'] } }
   ],
-  tmdbApiKey: '18c5a939865f2d093d1bcda9b234b58b',
-  authHeader: '',    
-  maxRequests: 60,
-  maxDepth: 4,
+  tmdbApiKey: '18c5a939865f2d093d1bcda9b234b58b',     // paste your TMDB key between the two quote marks
+  authHeader: '',     // leave empty
+  maxRequests: 200,   // page fetches per server, per title
+  parallel: 6,        // pages fetched at the same time
+  maxDepth: 5,        // how many folders deep to look
   timeoutMs: 8000,
-  debug: true         // when nothing is found, show an "ISP DEBUG" source that says why
+  debug: true         // when nothing is found, show "ISP DEBUG" sources that say why
 };
 
 var VIDEO_RE = /\.(mkv|mp4|avi|webm|m3u8|ts|mov)(\?.*)?$/i;
@@ -35,7 +36,7 @@ function http(url) {
       return r.text();
     })
     .catch(function (e) { DBG.lastErr = String(e && e.message ? e.message : e); return null; });
-    // Nuvio's JS engine may not have setTimeout, so the timeout is only used when it exists
+  // Nuvio's JS engine may not have setTimeout, so the timeout is only used when it exists
   if (typeof setTimeout !== 'function') return req;
   var timeout = new Promise(function (resolve) {
     setTimeout(function () { resolve(null); }, CONFIG.timeoutMs);
@@ -156,24 +157,37 @@ function crawl(server, info, mediaType, season, episode) {
           found.push(l);
         }
       } else if (job.depth < CONFIG.maxDepth) {
-        var matched = titleMatches(l.text, info) || titleMatches(decodeURIComponent_safe(l.url.split('?')[0].split('/').filter(Boolean).pop() || ''), info);
+        var fname = decodeURIComponent_safe(l.url.split('?')[0].split('/').filter(Boolean).pop() || '').replace(/^\s+|\s+$/g, '');
+        var matched = titleMatches(l.text, info) || titleMatches(fname, info);
         var next = { url: l.url, depth: job.depth + 1, inMatch: job.inMatch || matched };
-        var yearHit = !info.isTv && info.year && norm(l.text) === info.year;
-                // folders inside a matching folder (e.g. "Season 1") go first, so unrelated folders never use up the page limit
-        if (matched || job.inMatch) queue.unshift(next); else if (yearHit) queue.unshift(next); else queue.push(next);
+        if (matched || job.inMatch) { queue.unshift(next); continue; }
+        if (/^(19|20)\d\d$/.test(fname) && !info.isTv && info.year) {
+          if (fname === info.year) queue.unshift(next);
+          else if (Math.abs(parseInt(fname, 10) - parseInt(info.year, 10)) === 1) queue.push(next);
+          continue;
+        }
+        if (/\((19|20)\d\d\)/.test(fname)) continue;
+        queue.push(next);
       }
     }
   }
 
   function step() {
     if (!queue.length || budget <= 0 || found.length >= 10) return Promise.resolve(found);
-    var job = queue.shift();
-    if (found.length && !job.inMatch) return step();   // already found something: only finish the matching folders
-    if (visited[job.url]) return step();
-    visited[job.url] = true;
-    budget--;
-    return http(job.url).then(function (html) {
-      if (html) handle(html, job);
+    var batch = [];
+    while (queue.length && batch.length < CONFIG.parallel && budget > 0) {
+      var job = queue.shift();
+      if (found.length && !job.inMatch) continue;
+      if (visited[job.url]) continue;
+      visited[job.url] = true;
+      budget--;
+      batch.push(job);
+    }
+    if (!batch.length) return step();
+    return Promise.all(batch.map(function (j) {
+      return http(j.url).then(function (html) { return { job: j, html: html }; });
+    })).then(function (rs) {
+      rs.forEach(function (r) { if (r.html) handle(r.html, r.job); });
       return step();
     });
   }
