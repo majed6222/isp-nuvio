@@ -104,15 +104,25 @@ function extractLinks(html, base) {
   return out;
 }
 
+// What may follow the title in a file or folder name. Anything else (e.g. "Eleven Minutes",
+// "Oceans Eleven") means it is a different title.
+var TAIL_OK = /^(19\d\d|20\d\d|s\d+e\d+|s\d+|e\d+|\d+x\d+|season|seasons|complete|480p|576p|720p|1080p|2160p|4k|uhd|hd|hdr|bluray|bdrip|brrip|webrip|web|webdl|dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|cam|hdts|x264|x265|hevc|h264|h265|10bit|amzn|nf|dsnp|hmax|hulu|atvp|zee5|hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|turkish|urdu|dual|audio|dubbed|multi|org|orig|original|uncut|extended|mp4|mkv|avi|webm|mov|m3u8|ts)$/;
+
+function stripLead(s) { return s.replace(/^(the|an|a) /, ''); }
+
 function titleMatches(text, info) {
-  var en = ' ' + norm(text) + ' ';
+  var en = stripLead(norm(text));
   for (var i = 0; i < info.titles.length; i++) {
-    var tn = norm(info.titles[i]);
-    if (tn && en.indexOf(' ' + tn + ' ') >= 0) {
-      var y = en.match(/ (19\d\d|20\d\d) /);
-      if (!info.isTv && info.year && y && y[1] !== info.year) return false;
-      return true;
-    }
+    var tn = stripLead(norm(info.titles[i]));
+    if (!tn) continue;
+    if (en !== tn && en.indexOf(tn + ' ') !== 0) continue;      // the name must START with the title
+    var rest = en.slice(tn.length).replace(/^ /, '');
+    var first = rest.split(' ')[0];
+    if (first && !TAIL_OK.test(first)) continue;                  // e.g. "Eleven Minutes" is another film
+    // if the name carries a different year, it is another film
+    var y = (' ' + rest + ' ').match(/ (19\d\d|20\d\d) /);
+    if (!info.isTv && info.year && y && y[1] !== info.year) continue;
+    return true;
   }
   return false;
 }
@@ -152,8 +162,10 @@ function crawl(server, info, mediaType, season, episode) {
       if (originOf(l.url) !== baseOrigin) continue;
       if (l.isVideo) {
         var label = l.text + ' ' + l.url;
-        if ((job.inMatch || titleMatches(l.text, info) || titleMatches(decodeURIComponent_safe(l.url), info)) &&
+        var vname = decodeURIComponent_safe(l.url.split('?')[0].split('/').filter(Boolean).pop() || '');
+        if ((job.inMatch || titleMatches(l.text, info) || titleMatches(vname, info)) &&
             episodeMatches(label, mediaType, season, episode)) {
+          l.file = vname;
           found.push(l);
         }
       } else if (job.depth < CONFIG.maxDepth) {
@@ -210,8 +222,8 @@ function getStreams(tmdbId, mediaType, season, episode) {
             if (seen[h.url]) return;
             seen[h.url] = true;
             var stream = {
-              name: 'ISP - ' + server.name,
-              title: h.text,
+              name: server.name + ' | ' + (h.file || h.text),
+              title: h.file || h.text,
               url: h.url,
               quality: guessQuality(h.text + ' ' + h.url),
               provider: 'isp-local'
