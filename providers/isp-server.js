@@ -34,7 +34,11 @@ function debugStream(msg) {
 }
 
 function norm(s) {
-  return String(s || '').toLowerCase().replace(/&amp;|&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').replace(/^ | $/g, '');
+  s = String(s || '');
+  if (s.normalize) { try { s = s.normalize('NFD').replace(/[\u0300-\u036f]/g, ''); } catch (e) {} }
+  s = s.toLowerCase().replace(/['\u2019`]/g, '').replace(/&amp;|&/g, ' ').replace(/[^a-z0-9]+/g, ' ');
+  // "and" is dropped everywhere, because folders often leave out "&" (Law & Order -> Law-Order)
+  return s.split(' ').filter(function (w) { return w && w !== 'and'; }).join(' ');
 }
 
 function http(url) {
@@ -245,11 +249,14 @@ function crawl(server, info, mediaType, season, episode, extraPaths) {
           queue.unshift(next);
           continue;
         }
-        // decade folders like "2011-2020": go to the one that holds the release year
-        var rng = seg.match(/^((?:19|20)\d\d)\s*[-\u2013]\s*((?:19|20)\d\d)$/);
+        // year-range folders: "2011-2020", "2010--Before", "2021--Now"
+        var rng = seg.match(/^((?:19|20)\d\d)\s*[-\u2013_ ]+\s*((?:19|20)\d\d|before|older|below|earlier|after|now|present|latest|newer|onwards?|up)$/i);
         if (rng && info.year) {
-          var yr = parseInt(info.year, 10);
-          if (yr >= parseInt(rng[1], 10) && yr <= parseInt(rng[2], 10)) queue.unshift(next);
+          var yr = parseInt(info.year, 10), a1 = parseInt(rng[1], 10), w2 = rng[2].toLowerCase(), inR;
+          if (/^\d/.test(w2)) inR = yr >= a1 && yr <= parseInt(w2, 10);
+          else if (/^(before|older|below|earlier)$/.test(w2)) inR = yr <= a1;
+          else inR = yr >= a1;
+          if (inR) queue.unshift(next);
           else if (info.isTv) queue.push(next);
           continue;
         }
