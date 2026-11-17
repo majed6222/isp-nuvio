@@ -5,15 +5,27 @@ var CONFIG = {
   ],
   tmdbApiKey: '18c5a939865f2d093d1bcda9b234b58b',     // paste your TMDB key between the two quote marks
   authHeader: '',     // leave empty
+  // Optional file in your GitHub repo for titles that cannot be found automatically.
+  overridesUrl: 'https://raw.githubusercontent.com/majed6222/isp-nuvio/refs/heads/main/overrides.json',
   maxRequests: 200,   // page fetches per server, per title
   parallel: 6,        // pages fetched at the same time
-  maxDepth: 5,        // how many folders deep to look
+  maxDepth: 6,        // how many folders deep to look
   timeoutMs: 8000,
   debug: true         // when nothing is found, show "ISP DEBUG" sources that say why
 };
 
 var VIDEO_RE = /\.(mkv|mp4|avi|webm|m3u8|ts|mov)(\?.*)?$/i;
-var DBG = { tmdb: '', pages: 0, ok: 0, lastErr: '' };
+var DBG = { tmdb: '', pages: 0, ok: 0, lastErr: '', seen: [], ov: false };
+
+// Folder-name words that match the title's original language, so the likely folders are searched first.
+var LANG_HINT = {
+  en: 'english|hollywood', hi: 'hindi|bollywood', bn: 'bangla|bengali|dhallywood',
+  ko: 'korean', tr: 'turkish', ja: 'anim|japan', zh: 'chinese', es: 'spanish', fr: 'french',
+  de: 'german', ru: 'russian', th: 'thai', ta: 'south|tamil', te: 'south|telugu',
+  ml: 'south|malayalam', kn: 'south|kannada'
+};
+
+function isArr(x) { return Object.prototype.toString.call(x) === '[object Array]'; }
 
 function debugStream(msg) {
   return String(msg).split(' | ').map(function (part, i) {
@@ -44,6 +56,19 @@ function http(url) {
   return Promise.race([req, timeout]);
 }
 
+function loadOverrides() {
+  if (!CONFIG.overridesUrl) return Promise.resolve({});
+  var req = fetch(CONFIG.overridesUrl)
+    .then(function (r) { return r.ok ? r.json() : {}; })
+    .catch(function () { return {}; })
+    .then(function (j) { return (j && typeof j === 'object') ? j : {}; });
+  if (typeof setTimeout !== 'function') return req;
+  var timeout = new Promise(function (resolve) {
+    setTimeout(function () { resolve({}); }, 4000);
+  });
+  return Promise.race([req, timeout]);
+}
+
 function tmdbInfo(id, mediaType) {
   var key = (typeof TMDB_API_KEY !== 'undefined' && TMDB_API_KEY) || CONFIG.tmdbApiKey;
   if (!key) return Promise.reject(new Error('Set tmdbApiKey in CONFIG'));
@@ -57,8 +82,11 @@ function tmdbInfo(id, mediaType) {
         if (t && titles.indexOf(t) < 0) titles.push(t);
       });
       var year = String(j.release_date || j.first_air_date || '').slice(0, 4);
+      var hint = LANG_HINT[j.original_language] || '';
+      var anim = (j.genres || []).some(function (g) { return g && g.id === 16; });
+      if (anim) hint = hint ? hint + '|anim' : 'anim';
       DBG.tmdb = titles[0] + ' ' + year;
-      return { titles: titles, year: year, isTv: kind === 'tv' };
+      return { titles: titles, year: year, isTv: kind === 'tv', hint: hint ? new RegExp(hint, 'i') : null };
     });
 }
 
@@ -76,6 +104,10 @@ function resolveUrl(base, href) {
 function originOf(u) {
   var m = String(u).match(/^(https?:\/\/[^\/]+)/i);
   return m ? m[1].toLowerCase() : '';
+}
+
+function decodeURIComponent_safe(u) {
+  try { return decodeURIComponent(u); } catch (e) { return u; }
 }
 
 function extractLinks(html, base) {
@@ -106,7 +138,7 @@ function extractLinks(html, base) {
 
 // What may follow the title in a file or folder name. Anything else (e.g. "Eleven Minutes",
 // "Oceans Eleven") means it is a different title.
-var TAIL_OK = /^(19\d\d|20\d\d|s\d+e\d+|s\d+|e\d+|\d+x\d+|season|seasons|complete|480p|576p|720p|1080p|2160p|4k|uhd|hd|hdr|bluray|bdrip|brrip|webrip|web|webdl|dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|cam|hdts|x264|x265|hevc|h264|h265|10bit|amzn|nf|dsnp|hmax|hulu|atvp|zee5|hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|turkish|urdu|dual|audio|dubbed|multi|org|orig|original|uncut|extended|mp4|mkv|avi|webm|mov|m3u8|ts)$/;
+var TAIL_OK = /^(19\d\d|20\d\d|s\d+e\d+|s\d+|e\d+|\d+x\d+|season|seasons|complete|tv|series|show|shows|movie|film|webseries|480p|576p|720p|1080p|2160p|4k|uhd|hd|hdr|bluray|bdrip|brrip|webrip|web|webdl|dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|cam|hdts|x264|x265|hevc|h264|h265|10bit|amzn|nf|dsnp|hmax|hulu|atvp|zee5|hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|turkish|urdu|dual|audio|dubbed|multi|org|orig|original|uncut|extended|mp4|mkv|avi|webm|mov|m3u8|ts)$/;
 
 function stripLead(s) { return s.replace(/^(the|an|a) /, ''); }
 
@@ -127,12 +159,23 @@ function titleMatches(text, info) {
   return false;
 }
 
-function episodeMatches(text, mediaType, season, episode) {
+function episodeMatches(text, mediaType, season, episode, url) {
   if (mediaType !== 'tv') return true;
   var s = parseInt(season, 10), e = parseInt(episode, 10);
   var a = new RegExp('s0*' + s + '[ ._-]*e0*' + e + '(?![0-9])', 'i');
   var b = new RegExp('(^|[^0-9])0*' + s + 'x0*' + e + '(?![0-9])', 'i');
-  return a.test(text) || b.test(text);
+  if (a.test(text) || b.test(text)) return true;
+  // files named only "E02" or "Episode 2" inside a "Season 1" folder
+  var path = decodeURIComponent_safe(String(url || '')).split('?')[0];
+  var inSeason = new RegExp('(^|[\\/ ._-])(season|s)[ ._-]*0*' + s + '([\\/ ._-]|$)', 'i').test(path);
+  var file = path.split('/').pop();
+  var ep = new RegExp('(^|[^a-z0-9])(e|ep|episode)[ ._-]*0*' + e + '(?![0-9])', 'i');
+  return inSeason && ep.test(file);
+}
+
+function isOtherSeason(name, season) {
+  var m = String(name).match(/^(?:season|s)[ ._-]*0*(\d+)(?![0-9])/i);
+  return !!m && parseInt(m[1], 10) !== parseInt(season, 10);
 }
 
 function guessQuality(text) {
@@ -140,7 +183,22 @@ function guessQuality(text) {
   return m ? (m[0].toLowerCase() === '4k' ? '2160p' : m[0].toLowerCase()) : 'Unknown';
 }
 
-function crawl(server, info, mediaType, season, episode) {
+function similarNames(info) {
+  var t = norm(info.titles[0] || '').split(' ');
+  var first = (t[0] === 'the' || t[0] === 'a' || t[0] === 'an') && t.length > 1 ? t[1] : t[0];
+  if (!first || first.length < 3) return [];
+  var out = [], seen = {};
+  for (var i = 0; i < DBG.seen.length && out.length < 3; i++) {
+    var n = DBG.seen[i];
+    if (!seen[n] && (' ' + norm(n) + ' ').indexOf(' ' + first + ' ') >= 0) {
+      seen[n] = 1;
+      out.push(n.length > 45 ? n.slice(0, 45) + '..' : n);
+    }
+  }
+  return out;
+}
+
+function crawl(server, info, mediaType, season, episode, extraPaths) {
   var budget = CONFIG.maxRequests, found = [], visited = {}, queue = [];
   var base = server.base, baseOrigin = originOf(base);
   if (server.searchUrl) {
@@ -154,31 +212,57 @@ function crawl(server, info, mediaType, season, episode) {
   } else {
     queue.push({ url: base, depth: 0, inMatch: false });
   }
+  // folders you listed in overrides.json are searched first, and everything inside them counts as a match
+  if (isArr(extraPaths)) {
+    for (var x = extraPaths.length - 1; x >= 0; x--) {
+      if (typeof extraPaths[x] !== 'string') continue;
+      DBG.ov = true;
+      queue.unshift({ url: resolveUrl(base, encodeURI(decodeURIComponent_safe(extraPaths[x]))), depth: 0, inMatch: true });
+    }
+  }
 
   function handle(html, job) {
     var links = extractLinks(html, job.url);
     for (var i = 0; i < links.length; i++) {
       var l = links[i];
       if (originOf(l.url) !== baseOrigin) continue;
+      // the real file/folder name from the link (the visible text can be cut short, e.g. "Name..>")
+      var seg = decodeURIComponent_safe(l.url.split('?')[0].split('/').filter(Boolean).pop() || '').replace(/^\s+|\s+$/g, '');
+      if (DBG.seen.length < 6000) DBG.seen.push(seg);
       if (l.isVideo) {
         var label = l.text + ' ' + l.url;
-        var vname = decodeURIComponent_safe(l.url.split('?')[0].split('/').filter(Boolean).pop() || '');
-        if ((job.inMatch || titleMatches(l.text, info) || titleMatches(vname, info)) &&
-            episodeMatches(label, mediaType, season, episode)) {
-          l.file = vname;
+        if ((job.inMatch || titleMatches(l.text, info) || titleMatches(seg, info)) &&
+            episodeMatches(label, mediaType, season, episode, l.url)) {
+          l.file = seg;
           found.push(l);
         }
       } else if (job.depth < CONFIG.maxDepth) {
-        var fname = decodeURIComponent_safe(l.url.split('?')[0].split('/').filter(Boolean).pop() || '').replace(/^\s+|\s+$/g, '');
-        var matched = titleMatches(l.text, info) || titleMatches(fname, info);
+        var matched = titleMatches(l.text, info) || titleMatches(seg, info);
         var next = { url: l.url, depth: job.depth + 1, inMatch: job.inMatch || matched };
-        if (matched || job.inMatch) { queue.unshift(next); continue; }
-        if (/^(19|20)\d\d$/.test(fname) && !info.isTv && info.year) {
-          if (fname === info.year) queue.unshift(next);
-          else if (Math.abs(parseInt(fname, 10) - parseInt(info.year, 10)) === 1) queue.push(next);
+        // inside a matching folder: go in first, but skip the other seasons of a series
+        if (matched || job.inMatch) {
+          if (job.inMatch && !matched && mediaType === 'tv' && isOtherSeason(seg, season)) continue;
+          queue.unshift(next);
           continue;
         }
-        if (/\((19|20)\d\d\)/.test(fname)) continue;
+        // decade folders like "2011-2020": go to the one that holds the release year
+        var rng = seg.match(/^((?:19|20)\d\d)\s*[-\u2013]\s*((?:19|20)\d\d)$/);
+        if (rng && info.year) {
+          var yr = parseInt(info.year, 10);
+          if (yr >= parseInt(rng[1], 10) && yr <= parseInt(rng[2], 10)) queue.unshift(next);
+          else if (info.isTv) queue.push(next);
+          continue;
+        }
+        // movie year folders: go straight to the release year and skip other years (neighbouring years last)
+        if (/^(19|20)\d\d$/.test(seg) && !info.isTv && info.year) {
+          if (seg === info.year) queue.unshift(next);
+          else if (Math.abs(parseInt(seg, 10) - parseInt(info.year, 10)) === 1) queue.push(next);
+          continue;
+        }
+        // a folder named after another title, e.g. "Other Movie (2001)" or "Other-Show-(TV-Series-2014)"
+        if (/\([^)]*\b(19|20)\d\d\)/.test(seg)) continue;
+        // folders that fit the title's language (English, Hindi, Korean...) first
+        if (info.hint && info.hint.test(seg)) { queue.unshift(next); continue; }
         queue.push(next);
       }
     }
@@ -206,18 +290,17 @@ function crawl(server, info, mediaType, season, episode) {
   return step();
 }
 
-function decodeURIComponent_safe(u) {
-  try { return decodeURIComponent(u); } catch (e) { return u; }
-}
-
 function getStreams(tmdbId, mediaType, season, episode) {
-  DBG = { tmdb: '', pages: 0, ok: 0, lastErr: '' };
-  return tmdbInfo(tmdbId, mediaType).then(function (info) {
+  DBG = { tmdb: '', pages: 0, ok: 0, lastErr: '', seen: [], ov: false };
+  return Promise.all([tmdbInfo(tmdbId, mediaType), loadOverrides()]).then(function (r) {
+    var info = r[0], ov = r[1] || {};
+    var entry = ov[(mediaType === 'tv' ? 'tv' : 'movie') + ':' + tmdbId] || null;
     var results = [], seen = {};
     var chain = Promise.resolve();
     CONFIG.servers.forEach(function (server) {
       chain = chain.then(function () {
-        return crawl(server, info, mediaType, season, episode).then(function (hits) {
+        var extra = entry && entry[server.name] ? entry[server.name] : null;
+        return crawl(server, info, mediaType, season, episode, extra).then(function (hits) {
           hits.forEach(function (h) {
             if (seen[h.url]) return;
             seen[h.url] = true;
@@ -236,7 +319,11 @@ function getStreams(tmdbId, mediaType, season, episode) {
     });
     return chain.then(function () {
       if (!results.length && CONFIG.debug) {
-        return debugStream('Nothing found. TMDB: ' + DBG.tmdb + ' | server pages ok ' + DBG.ok + '/' + DBG.pages + (DBG.lastErr ? ' | last error: ' + DBG.lastErr : ''));
+        var sim = similarNames(info);
+        return debugStream('Nothing found. TMDB: ' + DBG.tmdb +
+          ' | server pages ok ' + DBG.ok + '/' + DBG.pages + (DBG.lastErr ? ' | last error: ' + DBG.lastErr : '') +
+          (DBG.ov ? ' | override folder was searched' : '') +
+          ' | ' + (sim.length ? 'Similar names seen: ' + sim.join(' ; ') : 'No similar names seen'));
       }
       return results.slice(0, 12);
     });
