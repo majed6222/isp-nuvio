@@ -85,12 +85,17 @@ function tmdbInfo(id, mediaType) {
       [j.title, j.name, j.original_title, j.original_name].forEach(function (t) {
         if (t && titles.indexOf(t) < 0) titles.push(t);
       });
+      var alts = [];
+      titles.forEach(function (t) {
+        var h = String(t).split(/\s*[:\u2013\u2014]\s*|\s+-\s+/)[0];
+        if (h && h !== t && h.length >= 4 && titles.indexOf(h) < 0 && alts.indexOf(h) < 0) alts.push(h);
+      });
       var year = String(j.release_date || j.first_air_date || '').slice(0, 4);
       var hint = LANG_HINT[j.original_language] || '';
       var anim = (j.genres || []).some(function (g) { return g && g.id === 16; });
       if (anim) hint = hint ? hint + '|anim' : 'anim';
       DBG.tmdb = titles[0] + ' ' + year;
-      return { titles: titles, year: year, isTv: kind === 'tv', hint: hint ? new RegExp(hint, 'i') : null };
+      return { titles: titles, alts: alts, year: year, isTv: kind === 'tv', hint: hint ? new RegExp(hint, 'i') : null };
     });
 }
 
@@ -148,16 +153,19 @@ function stripLead(s) { return s.replace(/^(the|an|a) /, ''); }
 
 function titleMatches(text, info) {
   var en = stripLead(norm(text));
-  for (var i = 0; i < info.titles.length; i++) {
-    var tn = stripLead(norm(info.titles[i]));
+  var all = info.titles.concat(info.alts || []);
+  for (var i = 0; i < all.length; i++) {
+    var isAlt = i >= info.titles.length;
+    var tn = stripLead(norm(all[i]));
     if (!tn) continue;
     if (en !== tn && en.indexOf(tn + ' ') !== 0) continue;      // the name must START with the title
     var rest = en.slice(tn.length).replace(/^ /, '');
     var first = rest.split(' ')[0];
     if (first && !TAIL_OK.test(first)) continue;                  // e.g. "Eleven Minutes" is another film
-    // if the name carries a different year, it is another film
     var y = (' ' + rest + ' ').match(/ (19\d\d|20\d\d) /);
     if (!info.isTv && info.year && y && y[1] !== info.year) continue;
+    // a short form of the title (before the ":") must carry the right year, to avoid other films of a series
+    if (isAlt && !info.isTv && !(y && y[1] === info.year)) continue;
     return true;
   }
   return false;
