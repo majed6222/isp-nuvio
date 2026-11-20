@@ -77,7 +77,7 @@ function tmdbInfo(id, mediaType) {
   var key = (typeof TMDB_API_KEY !== 'undefined' && TMDB_API_KEY) || CONFIG.tmdbApiKey;
   if (!key) return Promise.reject(new Error('Set tmdbApiKey in CONFIG'));
   var kind = mediaType === 'tv' ? 'tv' : 'movie';
-  id = String(id).replace(/[^0-9]/g, '');
+  id = (String(id).match(/\d+/) || [''])[0];
   var base = 'https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + key;
   function get(url) {
     return fetch(url).then(function (r) { return r.json(); }).catch(function () { return null; });
@@ -86,6 +86,14 @@ function tmdbInfo(id, mediaType) {
   // first with the other-titles list; if that gives nothing, once more in the plain form, then the other key if there is one
   return get(base + '&append_to_response=alternative_titles')
     .then(function (j) { return ok(j) ? j : get(base); })
+    .then(function (j) {
+      if (ok(j)) return j;
+      var other = kind === 'tv' ? 'movie' : 'tv';
+      return get('https://api.themoviedb.org/3/' + other + '/' + id + '?api_key=' + key).then(function (j2) {
+        if (ok(j2)) { kind = other; return j2; }
+        return j;
+      });
+    })
     .then(function (j) {
       var k2 = CONFIG.tmdbApiKey;
       if (ok(j) || !k2 || k2 === key) return j;
@@ -179,11 +187,15 @@ function titleMatches(text, info) {
     if (en !== tn && en.indexOf(tn + ' ') !== 0) continue;      // the name must START with the title
     var rest = en.slice(tn.length).replace(/^ /, '');
     var first = rest.split(' ')[0];
-    if (first && !TAIL_OK.test(first)) continue;                  // e.g. "Eleven Minutes" is another film
     var y = (' ' + rest + ' ').match(/ (19\d\d|20\d\d) /);
+    if (first && !TAIL_OK.test(first)) {
+      // e.g. "Eleven Minutes" is another film, unless the name ends with this title's own release year
+      // ("A Knight of the Seven Kingdoms The Hedge Knight (2026)")
+      if (!(info.year && y && y[1] === info.year && /(19|20)\d\d$/.test(rest))) continue;
+    }
     if (!info.isTv && info.year && y && y[1] !== info.year) continue;
-    // a short form of the title (before the ":") must carry the right year, to avoid other films of a series
-    if (isAlt && !info.isTv && !(y && y[1] === info.year)) continue;
+    // a short or other form of the title must carry the right year, to avoid other films or shows of the same series
+    if (isAlt && !(y && y[1] === info.year)) continue;
     return true;
   }
   return false;
