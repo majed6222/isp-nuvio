@@ -34,9 +34,9 @@ const showCache = new Map();   // show id -> episodes
 
 // ---------- helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const enc = (url) => 'dm:' + Buffer.from(url).toString('base64url');
+const enc = (url) => 'dm.' + Buffer.from(url).toString('base64url');
 function dec(id) {
-  try { return Buffer.from(String(id).replace(/^dm:/, ''), 'base64url').toString(); } catch (e) { return ''; }
+  try { return Buffer.from(String(id).replace(/^dm\./, ''), 'base64url').toString(); } catch (e) { return ''; }
 }
 function safeDecode(s) { try { return decodeURIComponent(s); } catch (e) { return s; } }
 function lastSeg(u) { return safeDecode(u.split('?')[0].split('/').filter(Boolean).pop() || ''); }
@@ -114,7 +114,7 @@ async function crawlRoot(type, rootPath, add) {
         job.depth > 0 && !container &&
         (files.length > 0 || (type === 'series' && dirs.some((d) => SEASON_DIR.test(d.name))));
       if (isTitleFolder) {
-        add(type, job.url, job.cat);
+        add(type, job.url, job.cat, false, files);
         continue;
       }
       // loose video files sitting in a year / category folder: each file is a title
@@ -157,7 +157,7 @@ async function buildIndex() {
   if (state.crawling) return;
   state.crawling = true; state.started = Date.now(); state.error = '';
   const fresh = {};
-  const add = (type, url, cat, isFile) => {
+  const add = (type, url, cat, isFile, files) => {
     const id = enc(url);
     if (fresh[id]) return;
     const seg = lastSeg(url);
@@ -165,6 +165,7 @@ async function buildIndex() {
     fresh[id] = Object.assign({}, old || {}, {
       id, type, url, cat: cat || 'Other', name: cleanName(seg), year: yearOf(seg), isFile: !!isFile
     });
+    if (type === 'movie' && files && files.length) fresh[id].files = files.map((f) => ({ file: f.name, url: f.url }));
   };
   try {
     await crawlRoot('movie', CFG.movies, add);
@@ -186,7 +187,7 @@ function loadIndex() {
   try {
     const j = JSON.parse(fs.readFileSync(CFG.indexFile, 'utf8'));
     index = j.items || []; byId = {};
-    index.forEach((e) => { byId[e.id] = e; });
+    index.forEach((e) => { e.id = enc(e.url); byId[e.id] = e; });
     return j.at || 0;
   } catch (e) { return 0; }
 }
@@ -235,6 +236,7 @@ async function showEpisodes(entry) {
 
 async function movieFiles(entry) {
   if (entry.isFile) return [{ file: lastSeg(entry.url), url: entry.url }];
+  if (entry.files && entry.files.length) return entry.files;
   const out = [];
   async function walk(url, depth) {
     const { dirs, files } = await list(url);
@@ -263,7 +265,7 @@ function manifest() {
     description: 'Every movie and series on server1.dhakamovie.com, straight from your ISP network.',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series'],
-    idPrefixes: ['dm:'],
+    idPrefixes: ['dm.'],
     catalogs: [cat('movie', 'dm-movies', 'Dhaka Movies'), cat('series', 'dm-series', 'Dhaka Series')]
   };
 }
@@ -310,7 +312,7 @@ async function meta(type, id) {
       if (seen[k]) return;
       seen[k] = 1;
       m.videos.push({
-        id: id + ':' + x.season + ':' + x.episode, title: 'Episode ' + x.episode, season: x.season, episode: x.episode,
+        id: id + '.' + x.season + '.' + x.episode, title: 'Episode ' + x.episode, season: x.season, episode: x.episode,
         released: new Date(Date.UTC(2000, 0, 1) + (x.season * 1000 + x.episode) * 86400000).toISOString()
       });
     });
@@ -320,8 +322,8 @@ async function meta(type, id) {
 }
 
 async function streams(type, rawId) {
-  const parts = String(rawId).split(':');   // dm:<code>[:season:episode]
-  const id = parts[0] + ':' + parts[1];
+  const parts = String(rawId).split('.');   // dm.<code>[.season.episode]
+  const id = parts[0] + '.' + parts[1];
   const e = byId[id] || (dec(id).indexOf(CFG.base) === 0 ? { id, type, url: dec(id), isFile: VIDEO_RE.test(dec(id)), name: '' } : null);
   if (!e) return { streams: [] };
   let list2;
@@ -359,16 +361,83 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { send(500, { error: String(e.message || e) }); }
 });
 
-server.listen(CFG.port, '0.0.0.0', () => {
-  console.log('Dhaka Movie addon on port ' + CFG.port);
-  console.log('Nuvio address: http://127.0.0.1:' + CFG.port + '/manifest.json');
-  const at = loadIndex();
-  console.log('Saved list: ' + index.length + ' titles');
-  if (!at || Date.now() - at > CFG.refreshHours * 3600 * 1000) {
-    console.log('Reading the server to build the list. This can take a while the first time...');
-    buildIndex().then(() => console.log('List ready: ' + index.length + ' titles'));
+async function exportSite(outDir) {
+  const w = (rel, obj) => {
+    const f = path.join(outDir, rel);
+    fs.mkdirSync(path.dirname(f), { recursive: true });
+    fs.writeFileSync(f, JSON.stringify(obj));
+  };
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.writeFileSync(path.join(outDir, '.nojekyll'), '');
+  const man = manifest();
+  man.catalogs.forEach((c) => { c.extra = c.extra.filter((x) => x.name !== 'search'); });   // a static site cannot search
+  w('manifest.json', man);
+  // catalog pages
+  for (const c of man.catalogs) {
+    const all = index.filter((e) => e.type === c.type)
+      .sort((a, b) => (b.year || '0').localeCompare(a.year || '0') || a.name.localeCompare(b.name));
+    const groups = [['', all]];
+    const gs = {};
+    all.forEach((e) => { (gs[e.cat] = gs[e.cat] || []).push(e); });
+    Object.keys(gs).forEach((g) => groups.push([g, gs[g]]));
+    for (const [g, items] of groups) {
+      const pages = Math.max(1, Math.ceil(items.length / CFG.pageSize));
+      for (let n = 0; n < pages; n++) {
+        const metas = items.slice(n * CFG.pageSize, (n + 1) * CFG.pageSize).map(toMeta);
+        const skip = n * CFG.pageSize;
+        let rel;
+        if (!g) rel = n === 0 ? 'catalog/' + c.type + '/' + c.id + '.json' : 'catalog/' + c.type + '/' + c.id + '/skip=' + skip + '.json';
+        else rel = 'catalog/' + c.type + '/' + c.id + '/genre=' + g + (n === 0 ? '' : '&skip=' + skip) + '.json';
+        w(rel, { metas });
+      }
+    }
   }
-});
+  console.log('Catalog pages written. Now reading every title for episodes and files...');
+  let i = 0, done = 0;
+  const total = index.length;
+  async function one() {
+    while (i < total) {
+      const e = index[i++];
+      try {
+        const m = await meta(e.type, e.id);
+        w('meta/' + e.type + '/' + e.id + '.json', m);
+        if (e.type === 'movie') w('stream/movie/' + e.id + '.json', await streams('movie', e.id));
+        else {
+          for (const v of (m.meta.videos || [])) w('stream/series/' + v.id + '.json', await streams('series', v.id));
+          showCache.delete(e.id);
+        }
+      } catch (err) { console.log('skipped ' + e.name + ': ' + (err.message || err)); }
+      done++;
+      if (done % 100 === 0) console.log(done + ' / ' + total + ' titles done');
+    }
+  }
+  await Promise.all(Array.from({ length: CFG.parallel }, one));
+  console.log('Finished. ' + total + ' titles written to ' + outDir);
+}
+
+if (process.argv[2] === 'export') {
+  const out = process.argv[3] || 'site';
+  const at = loadIndex();
+  (async () => {
+    if (!index.length || process.argv[4] === 'refresh') {
+      console.log('Reading the server to build the list first...');
+      await buildIndex();
+    }
+    console.log('Titles in list: ' + index.length);
+    await exportSite(out);
+    process.exit(0);
+  })();
+} else {
+  server.listen(CFG.port, '0.0.0.0', () => {
+    console.log('Dhaka Movie addon on port ' + CFG.port);
+    console.log('Nuvio address: http://127.0.0.1:' + CFG.port + '/manifest.json');
+    const at = loadIndex();
+    console.log('Saved list: ' + index.length + ' titles');
+    if (!at || Date.now() - at > CFG.refreshHours * 3600 * 1000) {
+      console.log('Reading the server to build the list. This can take a while the first time...');
+      buildIndex().then(() => console.log('List ready: ' + index.length + ' titles'));
+    }
+  });
+}
 
 module.exports = { buildIndex, CFG };
-
