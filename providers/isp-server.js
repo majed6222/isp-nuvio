@@ -77,7 +77,7 @@ function tmdbInfo(id, mediaType) {
   var key = (typeof TMDB_API_KEY !== 'undefined' && TMDB_API_KEY) || CONFIG.tmdbApiKey;
   if (!key) return Promise.reject(new Error('Set tmdbApiKey in CONFIG'));
   var kind = mediaType === 'tv' ? 'tv' : 'movie';
-  return fetch('https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + key)
+  return fetch('https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + key + '&append_to_response=alternative_titles')
     .then(function (r) { return r.json(); })
     .then(function (j) {
       if (!j || (!j.title && !j.name)) throw new Error('TMDB: ' + (j && j.status_message ? j.status_message : 'no data'));
@@ -86,7 +86,13 @@ function tmdbInfo(id, mediaType) {
         if (t && titles.indexOf(t) < 0) titles.push(t);
       });
       var alts = [];
-      titles.forEach(function (t) {
+      // other names TMDB knows for the same title (e.g. "Three Bags Full: A Sheep Detective Movie")
+      var at = j.alternative_titles && (j.alternative_titles.titles || j.alternative_titles.results);
+      if (isArr(at)) at.forEach(function (x) {
+        var t = x && (x.title || x.name);
+        if (t && t.length >= 4 && alts.length < 12 && titles.indexOf(t) < 0 && alts.indexOf(t) < 0) alts.push(t);
+      });
+      titles.concat(alts.slice()).forEach(function (t) {
         var h = String(t).split(/\s*[:\u2013\u2014]\s*|\s+-\s+/)[0];
         if (h && h !== t && h.length >= 4 && titles.indexOf(h) < 0 && alts.indexOf(h) < 0) alts.push(h);
       });
