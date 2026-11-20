@@ -77,8 +77,20 @@ function tmdbInfo(id, mediaType) {
   var key = (typeof TMDB_API_KEY !== 'undefined' && TMDB_API_KEY) || CONFIG.tmdbApiKey;
   if (!key) return Promise.reject(new Error('Set tmdbApiKey in CONFIG'));
   var kind = mediaType === 'tv' ? 'tv' : 'movie';
-  return fetch('https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + key + '&append_to_response=alternative_titles')
-    .then(function (r) { return r.json(); })
+  id = String(id).replace(/[^0-9]/g, '');
+  var base = 'https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + key;
+  function get(url) {
+    return fetch(url).then(function (r) { return r.json(); }).catch(function () { return null; });
+  }
+  function ok(j) { return j && (j.title || j.name); }
+  // first with the other-titles list; if that gives nothing, once more in the plain form, then the other key if there is one
+  return get(base + '&append_to_response=alternative_titles')
+    .then(function (j) { return ok(j) ? j : get(base); })
+    .then(function (j) {
+      var k2 = CONFIG.tmdbApiKey;
+      if (ok(j) || !k2 || k2 === key) return j;
+      return get('https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + k2);
+    })
     .then(function (j) {
       if (!j || (!j.title && !j.name)) throw new Error('TMDB: ' + (j && j.status_message ? j.status_message : 'no data'));
       var titles = [];
