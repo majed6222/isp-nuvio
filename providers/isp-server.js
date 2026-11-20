@@ -73,32 +73,35 @@ function loadOverrides() {
   return Promise.race([req, timeout]);
 }
 
-function tmdbInfo(id, mediaType) {
+function tmdbInfo(rawId, mediaType) {
   var key = (typeof TMDB_API_KEY !== 'undefined' && TMDB_API_KEY) || CONFIG.tmdbApiKey;
   if (!key) return Promise.reject(new Error('Set tmdbApiKey in CONFIG'));
   var kind = mediaType === 'tv' ? 'tv' : 'movie';
-  id = (String(id).match(/\d+/) || [''])[0];
-  var base = 'https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + key;
+  var raw = String(rawId);
   function get(url) {
     return fetch(url).then(function (r) { return r.json(); }).catch(function () { return null; });
   }
   function ok(j) { return j && (j.title || j.name); }
-  // first with the other-titles list; if that gives nothing, once more in the plain form, then the other key if there is one
-  return get(base + '&append_to_response=alternative_titles')
-    .then(function (j) { return ok(j) ? j : get(base); })
-    .then(function (j) {
-      if (ok(j)) return j;
-      var other = kind === 'tv' ? 'movie' : 'tv';
-      return get('https://api.themoviedb.org/3/' + other + '/' + id + '?api_key=' + key).then(function (j2) {
-        if (ok(j2)) { kind = other; return j2; }
-        return j;
-      });
-    })
-    .then(function (j) {
-      var k2 = CONFIG.tmdbApiKey;
-      if (ok(j) || !k2 || k2 === key) return j;
-      return get('https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + k2);
-    })
+  // Nuvio sometimes gives an IMDb id ("tt1234567") instead of a TMDB number: translate it first
+  function resolveId() {
+    var im = raw.match(/tt\d+/i);
+    if (!im) return Promise.resolve((raw.match(/\d+/) || [''])[0]);
+    return get('https://api.themoviedb.org/3/find/' + im[0] + '?api_key=' + key + '&external_source=imdb_id').then(function (j) {
+      j = j || {};
+      var list = kind === 'tv'
+        ? (j.tv_results || []).concat(j.tv_episode_results || [], j.tv_season_results || [])
+        : (j.movie_results || []);
+      var h = list[0];
+      if (!h) return '';
+      return String(h.show_id || h.id);
+    });
+  }
+  return resolveId().then(function (id) {
+    if (!id) throw new Error('TMDB: id not found for ' + raw);
+    var base = 'https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + key;
+    // first with the other-titles list; if that gives nothing, once more in the plain form
+    return get(base + '&append_to_response=alternative_titles').then(function (j) { return ok(j) ? j : get(base); });
+  })
     .then(function (j) {
       if (!j || (!j.title && !j.name)) throw new Error('TMDB: ' + (j && j.status_message ? j.status_message : 'no data'));
       var titles = [];
