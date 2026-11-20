@@ -362,6 +362,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function exportSite(outDir) {
+  // optional: CATS="Hollywood,Korean" exports only those folders (smaller, faster)
+  const only = (process.env.CATS || '').split(',').map((x) => x.trim()).filter(Boolean);
+  if (only.length) { index = index.filter((e) => only.indexOf(e.cat) >= 0); console.log('Only these folders: ' + only.join(', ') + ' (' + index.length + ' titles)'); }
   const w = (rel, obj) => {
     const f = path.join(outDir, rel);
     fs.mkdirSync(path.dirname(f), { recursive: true });
