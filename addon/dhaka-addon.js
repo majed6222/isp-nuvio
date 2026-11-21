@@ -130,23 +130,68 @@ async function crawlRoot(type, rootPath, add) {
   }
 }
 
+// ---------- posters ----------
+const normT = (t) => String(t || '').toLowerCase().replace(/['\u2019`]/g, '').replace(/&/g, ' ').replace(/[^a-z0-9]+/g, ' ')
+  .split(' ').filter((w) => w && w !== 'and' && w !== 'the').join(' ');
+const TAGS = /\b(2160p|1080p|720p|480p|4k|uhd|hdr|bluray|brrip|bdrip|webrip|web[ -]?dl|hdrip|hdtv|dvdrip|x264|x265|hevc|h264|10bit|hindi|english|bangla|dual|audio|dubbed|esubs?|amzn|nf|complete|season)\b.*$/i;
+
+function searchName(e) {
+  let n = String(e.name || '').replace(TAGS, ' ').trim();
+  const noYear = n.replace(/\b(19|20)\d\d\b.*$/, '').trim();
+  if (noYear) n = noYear;
+  return n;
+}
+async function getJson(url) {
+  try { const r = await fetch(url); return await r.json(); } catch (err) { return null; }
+}
+const yearNum = (d) => parseInt(String(d || '').slice(0, 4), 10) || 0;
+
+// A poster is used only when the title matches and the year fits. No poster is better than a wrong one.
 async function tmdbPoster(e) {
+  e.posterTried = true;
+  e.poster = ''; e.background = ''; e.description = '';
   if (!CFG.tmdbKey) return;
-  try {
-    const kind = e.type === 'series' ? 'tv' : 'movie';
-    const q = encodeURIComponent(e.name);
-    const yr = e.year ? '&' + (kind === 'tv' ? 'first_air_date_year=' : 'year=') + e.year : '';
-    const r = await fetch('https://api.themoviedb.org/3/search/' + kind + '?api_key=' + CFG.tmdbKey + '&query=' + q + yr);
-    const j = await r.json();
-    const h = j && j.results && j.results[0];
-    if (h) {
-      e.poster = h.poster_path ? 'https://image.tmdb.org/t/p/w342' + h.poster_path : '';
-      e.background = h.backdrop_path ? 'https://image.tmdb.org/t/p/w780' + h.backdrop_path : '';
-      e.description = h.overview || '';
+  const kind = e.type === 'series' ? 'tv' : 'movie';
+  const q = searchName(e), want = normT(q), wy = parseInt(e.year, 10) || 0;
+  if (!want) return;
+  async function search(withYear) {
+    const yr = withYear && wy ? '&' + (kind === 'tv' ? 'first_air_date_year=' : 'year=') + wy : '';
+    const j = await getJson('https://api.themoviedb.org/3/search/' + kind + '?api_key=' + CFG.tmdbKey + '&query=' + encodeURIComponent(q) + yr);
+    const res = (j && j.results) || [];
+    for (const r of res.slice(0, 8)) {
+      if (!r.poster_path) continue;
+      const ry = yearNum(r.release_date || r.first_air_date);
+      if (wy && ry && Math.abs(ry - wy) > 1) continue;
+      const names = [r.title, r.name, r.original_title, r.original_name].map(normT).filter(Boolean);
+      const exact = names.some((t) => t === want);
+      const prefix = want.split(' ').length >= 2 && ry === wy && names.some((t) => t.indexOf(want + ' ') === 0);
+      if (exact || prefix) return r;
     }
-    e.posterTried = true;
-    state.posters++;
-  } catch (err) { /* try again next rebuild */ }
+    return null;
+  }
+  let h = await search(true);
+  if (!h && wy) h = await search(false);
+  if (h) {
+    e.poster = 'https://image.tmdb.org/t/p/w342' + h.poster_path;
+    e.background = h.backdrop_path ? 'https://image.tmdb.org/t/p/w780' + h.backdrop_path : '';
+    e.description = h.overview || '';
+    return;
+  }
+  // second source for series: TVmaze (no key needed)
+  if (e.type === 'series') {
+    const j = await getJson('https://api.tvmaze.com/search/shows?q=' + encodeURIComponent(q));
+    for (const it of (j || []).slice(0, 5)) {
+      const sh = it && it.show;
+      if (!sh || !sh.image) continue;
+      const ry = yearNum(sh.premiered);
+      if (wy && ry && Math.abs(ry - wy) > 1) continue;
+      if (normT(sh.name) === want) {
+        e.poster = sh.image.original || sh.image.medium || '';
+        e.description = String(sh.summary || '').replace(/<[^>]*>/g, '');
+        return;
+      }
+    }
+  }
 }
 
 function save() {
@@ -175,7 +220,7 @@ async function buildIndex() {
     // posters, a few at a time
     const todo = index.filter((e) => !e.posterTried);
     let i = 0;
-    await Promise.all(Array.from({ length: 4 }, async () => {
+    await Promise.all(Array.from({ length: 8 }, async () => {
       while (i < todo.length) { const e = todo[i++]; await tmdbPoster(e); if (i % 200 === 0) save(); }
     }));
     save();
@@ -399,7 +444,19 @@ async function exportSite(outDir) {
   async function one() {
     while (i < total) {
       const e = index[i++];
-      if (!process.env.REFRESH && fs.existsSync(path.join(outDir, 'meta', e.type, e.id + '.json'))) { done++; continue; }
+      const mf = path.join(outDir, 'meta', e.type, e.id + '.json');
+      if (!process.env.REFRESH && fs.existsSync(mf)) {
+        // already exported: only refresh the picture and description
+        try {
+          const j = JSON.parse(fs.readFileSync(mf, 'utf8'));
+          if (j && j.meta) {
+            j.meta.poster = e.poster || undefined; j.meta.background = e.background || undefined;
+            if (e.description) j.meta.description = e.description;
+            fs.writeFileSync(mf, JSON.stringify(j));
+          }
+        } catch (err) {}
+        done++; continue;
+      }
       try {
         const m = await meta(e.type, e.id);
         w('meta/' + e.type + '/' + e.id + '.json', m);
@@ -417,7 +474,26 @@ async function exportSite(outDir) {
   console.log('Finished. ' + total + ' titles written to ' + outDir);
 }
 
-if (process.argv[2] === 'export') {
+if (process.argv[2] === 'posters') {
+  loadIndex();
+  (async () => {
+    const todo = process.argv[3] === 'missing' ? index.filter((e) => !e.poster) : index;
+    console.log('Checking posters for ' + todo.length + ' titles...');
+    let i = 0, done = 0, found = 0;
+    await Promise.all(Array.from({ length: 8 }, async () => {
+      while (i < todo.length) {
+        const e = todo[i++];
+        await tmdbPoster(e);
+        if (e.poster) found++;
+        done++;
+        if (done % 500 === 0) { console.log(done + ' / ' + todo.length + ' (' + found + ' posters found)'); save(); }
+      }
+    }));
+    save();
+    console.log('Finished. Posters found: ' + found + ' of ' + todo.length);
+    process.exit(0);
+  })();
+} else if (process.argv[2] === 'export') {
   const out = process.argv[3] || 'site';
   const at = loadIndex();
   (async () => {
