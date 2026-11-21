@@ -438,6 +438,8 @@ async function exportSite(outDir) {
       w(rel, { metas });
     }
   }
+  // list of every title, for the search service
+  w('search-index.json', index.map((e) => [e.id, e.type, e.name, e.year || '', String(e.poster || '').replace('https://image.tmdb.org/t/p/w342', ''), e.cat]));
   console.log('Catalog pages written. Now reading every title for episodes and files...');
   let i = 0, done = 0;
   const total = index.length;
