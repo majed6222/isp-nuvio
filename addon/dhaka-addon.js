@@ -265,12 +265,12 @@ function manifest() {
   const catalogs = [];
   [['movie', 'Movies'], ['series', 'Series']].forEach(([type, word]) => {
     cats(type).forEach((c) => {
-      catalogs.push({ type, id: catalogId(type, c), name: catLabel(c) + ' ' + word, extra: [{ name: 'skip', isRequired: false }] });
+      catalogs.push({ type, id: catalogId(type, c), name: 'Dhaka ' + catLabel(c), extra: [{ name: 'skip', isRequired: false }] });
     });
   });
   return {
     id: 'org.ispserver.dhakamovie',
-    version: '1.1.0',
+    version: '1.2.0',
     name: 'Dhaka Movie (ISP)',
     description: 'Every movie and series on server1.dhakamovie.com, straight from your ISP network.',
     resources: ['catalog', 'meta', 'stream'],
