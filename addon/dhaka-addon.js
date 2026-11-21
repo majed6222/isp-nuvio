@@ -248,25 +248,35 @@ async function movieFiles(entry) {
 }
 
 // ---------- Stremio endpoints ----------
+const CAT_ORDER = ['Hollywood', 'Bollywood', 'Korean', 'Indian_Bangla', 'South_Indian', 'English', 'Hindi', 'Animation', 'Animes', 'Turkish', 'IMDB_TOP_250', 'Others_Language'];
+const CAT_LABEL = { Indian_Bangla: 'Bengali', Others_Language: 'Others', IMDB_TOP_250: 'IMDb Top 250', South_Indian: 'South Indian' };
+const catLabel = (c) => CAT_LABEL[c] || String(c).replace(/_/g, ' ');
+const catalogId = (type, c) => 'dm-' + type + '-' + c;
+
 function manifest() {
+  // one catalog (one row in Nuvio) per folder, for movies and for series
   const cats = (type) => {
     const set = {};
     index.filter((e) => e.type === type).forEach((e) => { set[e.cat] = 1; });
-    return Object.keys(set).sort();
+    const all = Object.keys(set);
+    const first = CAT_ORDER.filter((c) => set[c]);
+    return first.concat(all.filter((c) => first.indexOf(c) < 0).sort());
   };
-  const cat = (type, id, name) => ({
-    type, id, name,
-    extra: [{ name: 'genre', options: cats(type), isRequired: false }, { name: 'search', isRequired: false }, { name: 'skip', isRequired: false }]
+  const catalogs = [];
+  [['movie', 'Movies'], ['series', 'Series']].forEach(([type, word]) => {
+    cats(type).forEach((c) => {
+      catalogs.push({ type, id: catalogId(type, c), name: catLabel(c) + ' ' + word, extra: [{ name: 'skip', isRequired: false }] });
+    });
   });
   return {
     id: 'org.ispserver.dhakamovie',
-    version: '1.0.0',
+    version: '1.1.0',
     name: 'Dhaka Movie (ISP)',
     description: 'Every movie and series on server1.dhakamovie.com, straight from your ISP network.',
     resources: ['catalog', 'meta', 'stream'],
     types: ['movie', 'series'],
     idPrefixes: ['dm.'],
-    catalogs: [cat('movie', 'dm-movies', 'Dhaka Movies'), cat('series', 'dm-series', 'Dhaka Series')]
+    catalogs
   };
 }
 
@@ -287,13 +297,9 @@ function toMeta(e) {
   };
 }
 
-function catalog(type, extra) {
-  let items = index.filter((e) => e.type === type);
-  if (extra.genre) items = items.filter((e) => e.cat === extra.genre);
-  if (extra.search) {
-    const q = extra.search.toLowerCase();
-    items = items.filter((e) => e.name.toLowerCase().indexOf(q) >= 0);
-  }
+function catalog(type, id, extra) {
+  const cat = String(id).replace('dm-' + type + '-', '');
+  let items = index.filter((e) => e.type === type && e.cat === cat);
   items.sort((a, b) => (b.year || '0').localeCompare(a.year || '0') || a.name.localeCompare(b.name));
   const skip = parseInt(extra.skip || '0', 10) || 0;
   return { metas: items.slice(skip, skip + CFG.pageSize).map(toMeta) };
@@ -354,7 +360,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (u === '/manifest') return send(200, manifest());
     const seg = u.split('/').filter(Boolean);
-    if (seg[0] === 'catalog') return send(200, catalog(seg[1], parseExtra(seg[3])));
+    if (seg[0] === 'catalog') return send(200, catalog(seg[1], seg[2], parseExtra(seg[3])));
     if (seg[0] === 'meta') return send(200, await meta(seg[1], seg.slice(2).join('/')));
     if (seg[0] === 'stream') return send(200, await streams(seg[1], seg.slice(2).join('/')));
     send(404, { error: 'not found' });
@@ -377,22 +383,14 @@ async function exportSite(outDir) {
   w('manifest.json', man);
   // catalog pages
   for (const c of man.catalogs) {
-    const all = index.filter((e) => e.type === c.type)
+    const cat = c.id.replace('dm-' + c.type + '-', '');
+    const items = index.filter((e) => e.type === c.type && e.cat === cat)
       .sort((a, b) => (b.year || '0').localeCompare(a.year || '0') || a.name.localeCompare(b.name));
-    const groups = [['', all]];
-    const gs = {};
-    all.forEach((e) => { (gs[e.cat] = gs[e.cat] || []).push(e); });
-    Object.keys(gs).forEach((g) => groups.push([g, gs[g]]));
-    for (const [g, items] of groups) {
-      const pages = Math.max(1, Math.ceil(items.length / CFG.pageSize));
-      for (let n = 0; n < pages; n++) {
-        const metas = items.slice(n * CFG.pageSize, (n + 1) * CFG.pageSize).map(toMeta);
-        const skip = n * CFG.pageSize;
-        let rel;
-        if (!g) rel = n === 0 ? 'catalog/' + c.type + '/' + c.id + '.json' : 'catalog/' + c.type + '/' + c.id + '/skip=' + skip + '.json';
-        else rel = 'catalog/' + c.type + '/' + c.id + '/genre=' + g + (n === 0 ? '' : '&skip=' + skip) + '.json';
-        w(rel, { metas });
-      }
+    const pages = Math.max(1, Math.ceil(items.length / CFG.pageSize));
+    for (let n = 0; n < pages; n++) {
+      const metas = items.slice(n * CFG.pageSize, (n + 1) * CFG.pageSize).map(toMeta);
+      const rel = n === 0 ? 'catalog/' + c.type + '/' + c.id + '.json' : 'catalog/' + c.type + '/' + c.id + '/skip=' + (n * CFG.pageSize) + '.json';
+      w(rel, { metas });
     }
   }
   console.log('Catalog pages written. Now reading every title for episodes and files...');
@@ -401,6 +399,7 @@ async function exportSite(outDir) {
   async function one() {
     while (i < total) {
       const e = index[i++];
+      if (!process.env.REFRESH && fs.existsSync(path.join(outDir, 'meta', e.type, e.id + '.json'))) { done++; continue; }
       try {
         const m = await meta(e.type, e.id);
         w('meta/' + e.type + '/' + e.id + '.json', m);
