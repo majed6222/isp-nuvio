@@ -85,7 +85,11 @@ module.exports = async (req, res) => {
     if (req.method === 'OPTIONS') return send(204, '');
     let p = req.query && req.query.p;
     if (Array.isArray(p)) p = p.join('/');
-    if (p === undefined) p = String(req.url || '/').split('?')[0];
+    if (p === undefined) {
+      const u = new URL(String(req.url || '/'), 'http://x');
+      p = u.searchParams.get('p');
+      if (p === null) p = u.pathname.replace(/^\/api\/addon/, '').replace(/^\/dm(?=\/|$)/, '');
+    }
     p = '/' + String(p).replace(/^\/+/, '');
     p = p.replace(/\.json$/, '');
     if (p === '/' || p === '') return send(200, { ok: true, message: 'Dhaka Movie addon is running. Add /manifest.json in Nuvio.' });
