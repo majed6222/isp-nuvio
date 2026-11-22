@@ -17,7 +17,7 @@ const CFG = {
   port: parseInt(process.env.PORT || '7000', 10),
   tmdbKey: process.env.TMDB_KEY || '18c5a939865f2d093d1bcda9b234b58b', // used only for posters and descriptions; '' to turn off
   indexFile: process.env.INDEX_FILE || path.join(__dirname, 'dhaka-index.json'),
-  parallel: 6,          // folder pages read at the same time
+  parallel: parseInt(process.env.PARALLEL || '16', 10),          // folder pages read at the same time
   maxDepth: 6,          // how many folders deep to look
   pageSize: 100,        // titles per catalog page
   refreshHours: 24      // rebuild the list when the saved one is older than this
@@ -586,7 +586,7 @@ async function exportSite(outDir) {
   w('search-index.json', index.map((e) => [e.id, e.type, e.name, e.year || '', String(e.poster || '').replace('https://image.tmdb.org/t/p/w342', ''), e.cat, e.det && e.det.rating ? +e.det.rating : 0, e.det ? e.det.genres.join('|') : '', e.tid || 0, e.added || 0]));
   console.log('Catalog pages written. Now reading every title for episodes and files...');
   let i = 0, done = 0;
-  const total = index.length;
+  const total = index.length, t0 = Date.now();
   async function one() {
     while (i < total) {
       const e = index[i++];
@@ -603,7 +603,7 @@ async function exportSite(outDir) {
           }
         } catch (err) {}
         done++;
-        if (done % 100 === 0) console.log(done + ' / ' + total + ' titles done');
+        if (done % 25 === 0) { const el = (Date.now() - t0) / 1000; console.log(done + ' / ' + total + ' titles done, about ' + Math.round((total - done) * el / done / 60) + ' minutes left'); }
         continue;
       }
       if (!process.env.REFRESH && fs.existsSync(mf)) {
@@ -628,7 +628,7 @@ async function exportSite(outDir) {
         }
       } catch (err) { console.log('skipped ' + e.name + ': ' + (err.message || err)); }
       done++;
-      if (done % 100 === 0) console.log(done + ' / ' + total + ' titles done');
+      if (done % 25 === 0) { const el = (Date.now() - t0) / 1000; console.log(done + ' / ' + total + ' titles done, about ' + Math.round((total - done) * el / done / 60) + ' minutes left'); }
     }
   }
   await Promise.all(Array.from({ length: CFG.parallel }, one));
