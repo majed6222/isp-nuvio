@@ -564,8 +564,10 @@ async function exportSite(outDir) {
   // optional: MIN_YEAR=2018 handles only titles from that year on (much faster)
   const minYear = parseInt(process.env.MIN_YEAR || '0', 10);
   const allIndex = index;
-  const todoSet = minYear ? new Set(index.filter((e) => (parseInt(e.year, 10) || 0) >= minYear).map((e) => e.id)) : null;
-  if (todoSet) console.log('Only titles from ' + minYear + ' on: ' + todoSet.size + ' of ' + index.length);
+  const maxYear = parseInt(process.env.MAX_YEAR || '0', 10);   // optional: MAX_YEAR=2024 stops at that year
+  const inRange = (e) => { const y = parseInt(e.year, 10) || 0; return y >= minYear && (!maxYear || y <= maxYear); };
+  const todoSet = (minYear || maxYear) ? new Set(index.filter(inRange).map((e) => e.id)) : null;
+  if (todoSet) console.log('Only titles from ' + (minYear || 'the start') + (maxYear ? ' to ' + maxYear : ' on') + ': ' + todoSet.size + ' of ' + index.length);
   const w = (rel, obj) => {
     const f = path.join(outDir, rel);
     fs.mkdirSync(path.dirname(f), { recursive: true });
@@ -593,7 +595,7 @@ async function exportSite(outDir) {
   let i = 0, done = 0;
   const total = todoSet ? todoSet.size : index.length, t0 = Date.now();
   async function one() {
-    while (i < total) {
+    while (i < index.length) {
       const e = index[i++];
       if (todoSet && !todoSet.has(e.id)) continue;
       const mf = path.join(outDir, 'meta', e.type, e.id + '.json');
