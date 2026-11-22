@@ -131,6 +131,36 @@ async function smart(kind, type, extra) {
   return { metas: list.slice(skip, skip + PAGE).map(toMeta) };
 }
 
+// ---------- subtitles from OpenSubtitles (needs the IMDb id, which comes from TMDB) ----------
+const imdbCache = new Map();
+async function imdbOf(type, tid) {
+  const k = type + ':' + tid;
+  if (imdbCache.has(k)) return imdbCache.get(k);
+  let id = '';
+  try {
+    const r = await fetch('https://api.themoviedb.org/3/' + (type === 'series' ? 'tv' : 'movie') + '/' + tid + '/external_ids?api_key=' + TMDB_KEY);
+    const j = await r.json();
+    id = (j && j.imdb_id) || '';
+  } catch (e) {}
+  if (id) imdbCache.set(k, id);
+  return id;
+}
+
+async function subtitles(type, rawId) {
+  const parts = String(rawId).split('.');          // dm.<code>[.season.episode]
+  const base = parts[0] + '.' + parts[1];
+  const item = (await loadIndex()).find((e) => e.id === base);
+  if (!item || !item.tid) return { subtitles: [] };
+  const imdb = await imdbOf(type, item.tid);
+  if (!imdb) return { subtitles: [] };
+  const vid = type === 'series' && parts.length >= 4 ? imdb + ':' + parts[2] + ':' + parts[3] : imdb;
+  try {
+    const r = await fetch('https://opensubtitles-v3.strem.io/subtitles/' + type + '/' + vid + '.json');
+    const j = await r.json();
+    return { subtitles: ((j && j.subtitles) || []).slice(0, 30) };
+  } catch (e) { return { subtitles: [] }; }
+}
+
 async function manifest() {
   const r = await fetch(PAGES + '/manifest.json');
   if (!r.ok) throw new Error('manifest.json not found (' + r.status + ')');
@@ -152,7 +182,8 @@ async function manifest() {
       { type: 'movie', id: 'dm-search-movie', name: 'Dhaka Search', extra: [{ name: 'search', isRequired: true }] },
       { type: 'series', id: 'dm-search-series', name: 'Dhaka Search', extra: [{ name: 'search', isRequired: true }] }
     ]);
-  m.version = '3.0.0';
+  m.resources = ['catalog', 'meta', 'stream', 'subtitles'];
+  m.version = '3.1.0';
   m.description = 'Every movie and series on server1.dhakamovie.com, with search, trending, top rated and genres.';
   return m;
 }
@@ -200,6 +231,7 @@ module.exports = async (req, res) => {
       const m = /^dm-(top|trend|pick|all)-(movie|series)$/.exec(seg[2] || '');
       if (m) return send(200, await smart(m[1], seg[1], extra), m[1] === 'pick' ? 0 : 600);
     }
+    if (seg[0] === 'subtitles') return send(200, await subtitles(seg[1], (seg[2] || '').replace(/\.json$/, '')), 86400);
     // everything else is a ready-made file on GitHub Pages
     if (['catalog', 'meta', 'stream'].indexOf(seg[0]) >= 0) {
       const url = PAGES + '/' + seg.map(encodeURIComponent).join('/') + '.json';
