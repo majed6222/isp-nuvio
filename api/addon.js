@@ -1,61 +1,159 @@
-// Dhaka Movie addon with search, for Vercel.
-// It never touches your ISP server. It only reads the files you published on GitHub Pages
-// (manifest, catalogs, meta, stream and search-index.json) and adds a search catalog on top.
+// Dhaka Movie addon on Vercel.
+// It never touches your ISP server. It reads the files you published on GitHub Pages
+// (manifest, catalogs, meta, stream and search-index.json) and adds smart features on top:
+// search (with typo tolerance), Trending, Top Rated, Random Picks and an "All" list with genre filter.
 
 const PAGES = (process.env.PAGES_URL || 'https://majed6222.github.io/isp-nuvio').replace(/\/$/, '');
+const TMDB_KEY = process.env.TMDB_KEY || '18c5a939865f2d093d1bcda9b234b58b';
 const POSTER_PREFIX = 'https://image.tmdb.org/t/p/w342';
+const PAGE = 100;
 
 let cache = { at: 0, items: null };
+
+const LABEL = { Indian_Bangla: 'Bengali', Others_Language: 'Others', IMDB_TOP_250: 'IMDb Top 250', South_Indian: 'South Indian' };
+const catLabel = (c) => LABEL[c] || String(c || '').replace(/_/g, ' ');
+
+function norm(s) {
+  return String(s || '').toLowerCase().replace(/['’`]/g, '').replace(/&/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
+}
 
 async function loadIndex() {
   if (cache.items && Date.now() - cache.at < 10 * 60 * 1000) return cache.items;
   const r = await fetch(PAGES + '/search-index.json');
   if (!r.ok) throw new Error('search-index.json not found (' + r.status + ')');
   const rows = await r.json();
-  cache = {
-    at: Date.now(),
-    items: rows.map((x) => ({ id: x[0], type: x[1], name: x[2], year: x[3], poster: x[4], cat: x[5], key: norm(x[2]) }))
-  };
-  return cache.items;
-}
-
-function norm(s) {
-  return String(s || '').toLowerCase().replace(/['’`]/g, '').replace(/&/g, ' ')
-    .replace(/[^a-z0-9]+/g, ' ').trim();
+  const items = rows.map((x) => {
+    const genres = x[7] ? String(x[7]).split('|') : [];
+    const nameKey = norm(x[2]);
+    return {
+      id: x[0], type: x[1], name: x[2], year: x[3], poster: x[4], cat: x[5],
+      rating: x[6] || 0, genres, tid: x[8] || 0, added: x[9] || 0,
+      key: nameKey, nameTokens: nameKey.split(' '),
+      full: norm(x[2] + ' ' + x[3] + ' ' + genres.join(' ') + ' ' + catLabel(x[5]))
+    };
+  });
+  cache = { at: Date.now(), items };
+  return items;
 }
 
 function toMeta(e) {
   return {
     id: e.id, type: e.type, name: e.name,
     poster: e.poster ? POSTER_PREFIX + e.poster : undefined,
-    releaseInfo: e.year || undefined, genres: [e.cat]
+    releaseInfo: e.year || undefined,
+    genres: e.genres.concat([catLabel(e.cat)]),
+    imdbRating: e.rating ? String(e.rating.toFixed ? e.rating.toFixed(1) : e.rating) : undefined
   };
+}
+
+// ---------- search with typo tolerance ----------
+function lev(a, b, max) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = [];
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (cur[j] < rowMin) rowMin = cur[j];
+    }
+    if (rowMin > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
 }
 
 async function search(type, q) {
   const words = norm(q).split(' ').filter(Boolean);
   if (!words.length) return { metas: [] };
-  const items = await loadIndex();
-  const hits = items.filter((e) => e.type === type && words.every((w) => e.key.indexOf(w) >= 0));
+  const items = (await loadIndex()).filter((e) => e.type === type);
   const text = words.join(' ');
+  let hits = items.filter((e) => words.every((w) => e.full.indexOf(w) >= 0));
+  if (hits.length < 5) {
+    // typos: every word must be inside the title/year/genre text, or be one or two letters away from a title word
+    const fuzzy = items.filter((e) => hits.indexOf(e) < 0 && words.every((w) =>
+      e.full.indexOf(w) >= 0 || (w.length >= 4 && e.nameTokens.some((t) => lev(w, t, w.length >= 7 ? 2 : 1) <= (w.length >= 7 ? 2 : 1)))));
+    hits = hits.concat(fuzzy);
+  }
   hits.sort((a, b) =>
     (b.key === text) - (a.key === text) ||
     (b.key.indexOf(text) === 0) - (a.key.indexOf(text) === 0) ||
+    (b.key.indexOf(text) >= 0) - (a.key.indexOf(text) >= 0) ||
     (b.year || '0').localeCompare(a.year || '0') ||
     a.name.localeCompare(b.name));
   return { metas: hits.slice(0, 60).map(toMeta) };
+}
+
+// ---------- smart rows ----------
+let trendCache = {};
+async function trending(type) {
+  const kind = type === 'series' ? 'tv' : 'movie';
+  const c = trendCache[kind];
+  if (c && Date.now() - c.at < 6 * 3600 * 1000) return c.ids;
+  const ids = [];
+  for (let page = 1; page <= 5; page++) {
+    try {
+      const r = await fetch('https://api.themoviedb.org/3/trending/' + kind + '/week?api_key=' + TMDB_KEY + '&page=' + page);
+      const j = await r.json();
+      (j.results || []).forEach((x) => ids.push(x.id));
+    } catch (e) {}
+  }
+  trendCache[kind] = { at: Date.now(), ids };
+  return ids;
+}
+
+function genreList(items) {
+  const n = {};
+  items.forEach((e) => e.genres.forEach((g) => { n[g] = (n[g] || 0) + 1; }));
+  return Object.keys(n).sort((a, b) => n[b] - n[a]).slice(0, 24);
+}
+
+async function smart(kind, type, extra) {
+  let items = (await loadIndex()).filter((e) => e.type === type);
+  if (extra.genre) items = items.filter((e) => e.genres.indexOf(extra.genre) >= 0);
+  const skip = parseInt(extra.skip || '0', 10) || 0;
+  let list;
+  if (kind === 'top') {
+    list = items.filter((e) => e.rating > 0 && e.poster).sort((a, b) => b.rating - a.rating || (b.year || '0').localeCompare(a.year || '0'));
+  } else if (kind === 'trend') {
+    const ids = await trending(type);
+    const byTid = {};
+    items.forEach((e) => { if (e.tid) byTid[e.tid] = e; });
+    list = ids.map((i) => byTid[i]).filter(Boolean);
+  } else if (kind === 'pick') {
+    const pool = items.filter((e) => e.poster);
+    list = [];
+    for (let i = 0; i < 40 && pool.length; i++) list.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+  } else {   // all
+    list = items.slice().sort((a, b) => (b.year || '0').localeCompare(a.year || '0') || a.name.localeCompare(b.name));
+  }
+  return { metas: list.slice(skip, skip + PAGE).map(toMeta) };
 }
 
 async function manifest() {
   const r = await fetch(PAGES + '/manifest.json');
   if (!r.ok) throw new Error('manifest.json not found (' + r.status + ')');
   const m = await r.json();
-  m.version = '2.0.0';
-  m.description = 'Every movie and series on server1.dhakamovie.com, with search.';
-  m.catalogs = (m.catalogs || []).concat([
-    { type: 'movie', id: 'dm-search-movie', name: 'Dhaka Search', extra: [{ name: 'search', isRequired: true }] },
-    { type: 'series', id: 'dm-search-series', name: 'Dhaka Search', extra: [{ name: 'search', isRequired: true }] }
-  ]);
+  let genres = [];
+  try { genres = genreList(await loadIndex()); } catch (e) {}
+  const skip = { name: 'skip', isRequired: false };
+  const gen = genres.length ? [{ name: 'genre', options: genres, isRequired: false }, skip] : [skip];
+  const mk = (id, name, extra) => ['movie', 'series'].map((t) => ({ type: t, id: 'dm-' + id + '-' + t, name, extra }));
+  const old = m.catalogs || [];
+  const isNew = (c) => /_new$/.test(c.id);
+  m.catalogs = old.filter(isNew)
+    .concat(mk('trend', 'Dhaka Trending', [skip]))
+    .concat(mk('top', 'Dhaka Top Rated', gen))
+    .concat(mk('pick', 'Dhaka Random Picks', []))
+    .concat(old.filter((c) => !isNew(c)))
+    .concat(mk('all', 'Dhaka All', gen))
+    .concat([
+      { type: 'movie', id: 'dm-search-movie', name: 'Dhaka Search', extra: [{ name: 'search', isRequired: true }] },
+      { type: 'series', id: 'dm-search-series', name: 'Dhaka Search', extra: [{ name: 'search', isRequired: true }] }
+    ]);
+  m.version = '3.0.0';
+  m.description = 'Every movie and series on server1.dhakamovie.com, with search, trending, top rated and genres.';
   return m;
 }
 
@@ -92,14 +190,15 @@ module.exports = async (req, res) => {
     }
     p = '/' + String(p).replace(/^\/+/, '');
     p = p.replace(/\.json$/, '');
-    if (p === '/' || p === '') return send(200, { ok: true, message: 'Dhaka Movie addon is running. Add /manifest.json in Nuvio.' });
+    if (p === '/' || p === '') return send(200, { ok: true, message: 'Dhaka Movie addon is running. Add /dm/manifest.json in Nuvio.' });
     if (p === '/manifest') return send(200, await manifest(), 300);
 
     const seg = p.split('/').filter(Boolean);
-    // search catalogs
-    if (seg[0] === 'catalog' && /^dm-search-/.test(seg[2] || '')) {
+    if (seg[0] === 'catalog') {
       const extra = parseExtra(seg.slice(3).join('/'));
-      return send(200, await search(seg[1], extra.search || ''), 60);
+      if (/^dm-search-/.test(seg[2] || '')) return send(200, await search(seg[1], extra.search || ''), 60);
+      const m = /^dm-(top|trend|pick|all)-(movie|series)$/.exec(seg[2] || '');
+      if (m) return send(200, await smart(m[1], seg[1], extra), m[1] === 'pick' ? 0 : 600);
     }
     // everything else is a ready-made file on GitHub Pages
     if (['catalog', 'meta', 'stream'].indexOf(seg[0]) >= 0) {
