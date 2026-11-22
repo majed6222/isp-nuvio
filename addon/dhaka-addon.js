@@ -17,12 +17,13 @@ const CFG = {
   port: parseInt(process.env.PORT || '7000', 10),
   tmdbKey: process.env.TMDB_KEY || '18c5a939865f2d093d1bcda9b234b58b', // used only for posters and descriptions; '' to turn off
   indexFile: process.env.INDEX_FILE || path.join(__dirname, 'dhaka-index.json'),
-  parallel: 6,          // folder pages read at the same time
+  parallel: parseInt(process.env.PARALLEL || '16', 10),          // folder pages read at the same time
   maxDepth: 6,          // how many folders deep to look
   pageSize: 100,        // titles per catalog page
   refreshHours: 24      // rebuild the list when the saved one is older than this
 };
 
+const SUB_RE = /\.(srt|vtt)(\?.*)?$/i;
 const VIDEO_RE = /\.(mkv|mp4|avi|webm|m3u8|ts|mov)(\?.*)?$/i;
 const SEASON_DIR = /^(season|series|s)[ ._-]*0*\d+/i;
 
@@ -31,6 +32,7 @@ let byId = {};
 let state = { crawling: false, pages: 0, posters: 0, started: 0, finished: 0, error: '' };
 const listCache = new Map();   // url -> { dirs, files }
 const showCache = new Map();   // show id -> episodes
+const sizeOf = new Map();      // video url -> bytes (when the folder page shows sizes)
 
 // ---------- helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -60,7 +62,7 @@ async function getText(url) {
 async function list(url) {
   if (listCache.has(url)) return listCache.get(url);
   const html = await getText(url);
-  const out = { dirs: [], files: [] };
+  const out = { dirs: [], files: [], subs: [] };
   if (!html) return out;
   const seen = new Set();
   const re = /<a\s[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>/gi;
@@ -74,7 +76,14 @@ async function list(url) {
     seen.add(full);
     const name = lastSeg(full);
     if (/\/$/.test(full.split('?')[0])) out.dirs.push({ name, url: full });
-    else if (VIDEO_RE.test(full)) out.files.push({ name, url: full });
+    else if (VIDEO_RE.test(full)) {
+      out.files.push({ name, url: full });
+      // size shown on the folder page after the date, e.g. "12-Nov-2026 10:30  1503238553" or "... 1.4G"
+      const tail = html.slice(m.index + m[0].length, m.index + m[0].length + 300).split(/<a\s|\n|<\/tr>/i)[0]
+        .replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').trim();
+      const sm = tail.match(/\d\d:\d\d(?::\d\d)?\s+(\d+(?:\.\d+)?)\s*([KMGT]?)i?B?\s*$/i);
+      if (sm) sizeOf.set(full, Math.round(parseFloat(sm[1]) * ({ '': 1, K: 1024, M: 1048576, G: 1073741824, T: 1099511627776 })[sm[2].toUpperCase()]));
+    } else if (SUB_RE.test(full)) out.subs.push({ name, url: full });
   }
   if (listCache.size > 3000) listCache.clear();
   listCache.set(url, out);
@@ -101,7 +110,7 @@ function quality(t) {
 }
 
 // ---------- crawl everything into the index ----------
-async function crawlRoot(type, rootPath, add) {
+async function crawlRoot(type, rootPath, add, known) {
   const root = new URL(rootPath, CFG.base).href;
   const queue = [{ url: root, depth: 0, cat: '', name: '' }];
   async function worker() {
@@ -120,7 +129,12 @@ async function crawlRoot(type, rootPath, add) {
       // loose video files sitting in a year / category folder: each file is a title
       for (const f of files) add(type, f.url, job.cat, true);
       if (job.depth >= CFG.maxDepth) continue;
-      for (const d of dirs) queue.push({ url: d.url, depth: job.depth + 1, cat: job.depth === 0 ? d.name : job.cat, name: d.name });
+      for (const d of dirs) {
+        // update mode: a folder that is already a known title is not opened again
+        const k = known && known[enc(d.url)];
+        if (k && !k.isFile && k.type === type && job.depth > 0) { add(type, d.url, job.cat, false, k.files && k.files.map((f) => ({ name: f.file, url: f.url }))); continue; }
+        queue.push({ url: d.url, depth: job.depth + 1, cat: job.depth === 0 ? d.name : job.cat, name: d.name });
+      }
     }
   }
   // the queue can be empty for a moment while others work, so run workers in rounds
@@ -149,7 +163,7 @@ const yearNum = (d) => parseInt(String(d || '').slice(0, 4), 10) || 0;
 // A poster is used only when the title matches and the year fits. No poster is better than a wrong one.
 async function tmdbPoster(e) {
   e.posterTried = true;
-  e.poster = ''; e.background = ''; e.description = '';
+  e.poster = ''; e.background = ''; e.description = ''; e.tid = 0; e.det = null;
   if (!CFG.tmdbKey) return;
   const kind = e.type === 'series' ? 'tv' : 'movie';
   const q = searchName(e), want = normT(q), wy = parseInt(e.year, 10) || 0;
@@ -175,6 +189,22 @@ async function tmdbPoster(e) {
     e.poster = 'https://image.tmdb.org/t/p/w342' + h.poster_path;
     e.background = h.backdrop_path ? 'https://image.tmdb.org/t/p/w780' + h.backdrop_path : '';
     e.description = h.overview || '';
+    e.tid = h.id;
+    // rating, genres, cast, director, runtime
+    const d = await getJson('https://api.themoviedb.org/3/' + kind + '/' + h.id + '?api_key=' + CFG.tmdbKey + '&append_to_response=credits');
+    if (d && !d.status_code) {
+      const crew = (d.credits && d.credits.crew) || [];
+      e.det = {
+        rating: d.vote_average ? d.vote_average.toFixed(1) : '',
+        genres: (d.genres || []).map((g) => g.name).slice(0, 4),
+        runtime: d.runtime || (d.episode_run_time && d.episode_run_time[0]) || 0,
+        tagline: d.tagline || '',
+        cast: ((d.credits && d.credits.cast) || []).slice(0, 8).map((c) => c.name),
+        director: (kind === 'tv' ? (d.created_by || []).map((c) => c.name) : crew.filter((c) => c.job === 'Director').map((c) => c.name)).slice(0, 2),
+        released: d.release_date || d.first_air_date || ''
+      };
+      if (d.overview) e.description = d.overview;
+    }
     return;
   }
   // second source for series: TVmaze (no key needed)
@@ -198,7 +228,7 @@ function save() {
   try { fs.writeFileSync(CFG.indexFile, JSON.stringify({ at: Date.now(), items: index })); } catch (e) {}
 }
 
-async function buildIndex() {
+async function buildIndex(incremental) {
   if (state.crawling) return;
   state.crawling = true; state.started = Date.now(); state.error = '';
   const fresh = {};
@@ -210,11 +240,14 @@ async function buildIndex() {
     fresh[id] = Object.assign({}, old || {}, {
       id, type, url, cat: cat || 'Other', name: cleanName(seg), year: yearOf(seg), isFile: !!isFile
     });
+    // when a title is first seen it gets a date (used by the "Recently Added" row); the very first build leaves it empty
+    if (!old) { fresh[id].added = Object.keys(byId).length ? Date.now() : 0; state.newCount = (state.newCount || 0) + 1; }
     if (type === 'movie' && files && files.length) fresh[id].files = files.map((f) => ({ file: f.name, url: f.url }));
   };
   try {
-    await crawlRoot('movie', CFG.movies, add);
-    await crawlRoot('series', CFG.series, add);
+    state.newCount = 0;
+    await crawlRoot('movie', CFG.movies, add, incremental ? byId : null);
+    await crawlRoot('series', CFG.series, add, incremental ? byId : null);
     const items = Object.values(fresh);
     if (items.length) { index = items; byId = fresh; save(); }
     // posters, a few at a time
@@ -252,11 +285,35 @@ function parseEpisode(file, url) {
   return { season: s, episode: e };
 }
 
+// ---------- subtitles (.srt / .vtt found next to the videos) ----------
+function subLang(name) {
+  const n = ' ' + safeDecode(name).toLowerCase().replace(/[._()\[\]-]+/g, ' ') + ' ';
+  if (/ (bn|ben|bangla|bengali) /.test(n)) return 'ben';
+  if (/ (hi|hin|hindi) /.test(n)) return 'hin';
+  if (/ (ar|ara|arabic) /.test(n)) return 'ara';
+  if (/ (ko|kor|korean) /.test(n)) return 'kor';
+  if (/ (tr|tur|turkish) /.test(n)) return 'tur';
+  return 'eng';
+}
+const baseOf = (n) => safeDecode(n).toLowerCase().replace(/\.(mkv|mp4|avi|webm|m3u8|ts|mov|srt|vtt)$/, '').replace(/[^a-z0-9]+/g, '');
+function pickSubs(subs, file, season, episode, isSeries, videoCount) {
+  if (!subs.length) return [];
+  const vb = baseOf(file);
+  let hit = subs.filter((x) => { const sb = baseOf(x.name); return sb === vb || sb.indexOf(vb) === 0 || (vb.length > 8 && vb.indexOf(sb) === 0); });
+  if (!hit.length && isSeries && episode !== null) {
+    hit = subs.filter((x) => { const pe = parseEpisode(x.name, x.url); return pe.episode === episode && pe.season === season; });
+  }
+  if (!hit.length && !isSeries && videoCount <= 1) hit = subs;
+  return hit.slice(0, 8).map((x, i) => ({ id: 'dm-' + i + '-' + safeDecode(x.name), url: x.url, lang: subLang(x.name) }));
+}
+
 async function showEpisodes(entry) {
   if (showCache.has(entry.id)) return showCache.get(entry.id);
   const eps = [];
+  const allSubs = [];
   async function walk(url, depth) {
-    const { dirs, files } = await list(url);
+    const { dirs, files, subs } = await list(url);
+    subs.forEach((x) => allSubs.push(x));
     for (const f of files) {
       const pe = parseEpisode(f.name, f.url);
       eps.push({ file: f.name, url: f.url, season: pe.season, episode: pe.episode });
@@ -275,13 +332,27 @@ async function showEpisodes(entry) {
     let n = 0;
     bySeason[k].forEach((x) => { n++; if (x.episode === null) x.episode = n; });
   });
+  eps.forEach((x) => { x.subs = pickSubs(allSubs, x.file, x.season, x.episode, true, 0); });
   showCache.set(entry.id, eps);
   return eps;
 }
 
+async function movieSubs(entry) {
+  const found = [];
+  try {
+    const top = await list(entry.url);
+    top.subs.forEach((x) => found.push(x));
+    for (const d of top.dirs.filter((d) => /sub|srt|caption/i.test(d.name)).slice(0, 3)) (await list(d.url)).subs.forEach((x) => found.push(x));
+  } catch (e) {}
+  return found;
+}
+
 async function movieFiles(entry) {
   if (entry.isFile) return [{ file: lastSeg(entry.url), url: entry.url }];
-  if (entry.files && entry.files.length) return entry.files;
+  if (entry.files && entry.files.length) {
+    const subs = await movieSubs(entry);
+    return entry.files.map((f) => Object.assign({}, f, { subs: pickSubs(subs, f.file, null, null, false, entry.files.length) }));
+  }
   const out = [];
   async function walk(url, depth) {
     const { dirs, files } = await list(url);
@@ -289,6 +360,8 @@ async function movieFiles(entry) {
     if (depth < 2) await Promise.all(dirs.map((d) => walk(d.url, depth + 1)));
   }
   await walk(entry.url, 0);
+  const subs = await movieSubs(entry);
+  out.forEach((f) => { f.subs = pickSubs(subs, f.file, null, null, false, out.length); });
   return out;
 }
 
@@ -309,13 +382,14 @@ function manifest() {
   };
   const catalogs = [];
   [['movie', 'Movies'], ['series', 'Series']].forEach(([type, word]) => {
+    if (index.some((e) => e.type === type && e.added > 0)) catalogs.push({ type, id: catalogId(type, '_new'), name: 'Dhaka Recently Added', extra: [] });
     cats(type).forEach((c) => {
       catalogs.push({ type, id: catalogId(type, c), name: 'Dhaka ' + catLabel(c), extra: [{ name: 'skip', isRequired: false }] });
     });
   });
   return {
     id: 'org.ispserver.dhakamovie',
-    version: '1.2.0',
+    version: '1.3.0',
     name: 'Dhaka Movie (ISP)',
     description: 'Every movie and series on server1.dhakamovie.com, straight from your ISP network.',
     resources: ['catalog', 'meta', 'stream'],
@@ -334,26 +408,68 @@ function parseExtra(s) {
   return o;
 }
 
-function toMeta(e) {
-  return {
-    id: e.id, type: e.type, name: e.name + (e.year && !/(19|20)\d\d/.test(e.name) ? '' : ''),
+function toMeta(e, full) {
+  const d = e.det || null;
+  const m = {
+    id: e.id, type: e.type, name: e.name,
     poster: e.poster || undefined, background: e.background || undefined,
-    description: e.description || ('Folder: ' + e.cat), releaseInfo: e.year || undefined, genres: [e.cat]
+    description: e.description || ('Folder: ' + e.cat), releaseInfo: e.year || undefined,
+    genres: (d && d.genres.length ? d.genres : []).concat([catLabel(e.cat)]),
+    imdbRating: d && d.rating ? d.rating : undefined
   };
+  if (full && d) {
+    if (d.runtime) m.runtime = d.runtime + ' min';
+    if (d.cast.length) m.cast = d.cast;
+    if (d.director.length) m.director = d.director;
+    if (d.released) m.released = new Date(d.released).toISOString();
+    if (d.tagline) m.slogan = d.tagline;
+  }
+  return m;
+}
+
+// titles of one row; "_new" is the Recently Added row
+function catItems(type, cat) {
+  if (cat === '_new') return index.filter((e) => e.type === type && e.added > 0).sort((a, b) => b.added - a.added).slice(0, CFG.pageSize);
+  return index.filter((e) => e.type === type && e.cat === cat)
+    .sort((a, b) => (b.year || '0').localeCompare(a.year || '0') || a.name.localeCompare(b.name));
 }
 
 function catalog(type, id, extra) {
   const cat = String(id).replace('dm-' + type + '-', '');
-  let items = index.filter((e) => e.type === type && e.cat === cat);
-  items.sort((a, b) => (b.year || '0').localeCompare(a.year || '0') || a.name.localeCompare(b.name));
+  const items = catItems(type, cat);
   const skip = parseInt(extra.skip || '0', 10) || 0;
-  return { metas: items.slice(skip, skip + CFG.pageSize).map(toMeta) };
+  return { metas: items.slice(skip, skip + CFG.pageSize).map((e) => toMeta(e)) };
+}
+
+// episode names, descriptions and pictures from TMDB
+const seasonCache = new Map();
+async function enrichVideos(m, e) {
+  if (!e.tid || !CFG.tmdbKey || !m.videos || !m.videos.length) return;
+  const seasons = Array.from(new Set(m.videos.map((v) => v.season)));
+  for (const sn of seasons) {
+    const k = e.tid + ':' + sn;
+    if (!seasonCache.has(k)) {
+      const j = await getJson('https://api.themoviedb.org/3/tv/' + e.tid + '/season/' + sn + '?api_key=' + CFG.tmdbKey);
+      seasonCache.set(k, j && j.episodes ? j.episodes : []);
+      if (seasonCache.size > 500) seasonCache.delete(seasonCache.keys().next().value);
+    }
+    const eps = seasonCache.get(k);
+    m.videos.forEach((v) => {
+      if (v.season !== sn) return;
+      const x = eps.find((y) => y.episode_number === v.episode);
+      if (!x) return;
+      if (x.name) v.title = x.name;
+      if (x.overview) v.overview = x.overview;
+      if (x.still_path) v.thumbnail = 'https://image.tmdb.org/t/p/w300' + x.still_path;
+      if (x.air_date) v.released = new Date(x.air_date).toISOString();
+    });
+  }
 }
 
 async function meta(type, id) {
   const e = byId[id] || (dec(id).indexOf(CFG.base) === 0 ? { id, type, url: dec(id), name: cleanName(lastSeg(dec(id))), cat: '' } : null);
   if (!e) return { meta: null };
-  const m = toMeta(e);
+  const m = toMeta(e, true);
   if (type === 'series') {
     const eps = await showEpisodes(e);
     const seen = {};
@@ -368,8 +484,29 @@ async function meta(type, id) {
       });
     });
     m.videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
+    await enrichVideos(m, e);
   }
   return { meta: m };
+}
+
+function fmtSize(b) {
+  if (!b) return '';
+  return b >= 1073741824 ? (b / 1073741824).toFixed(1) + ' GB' : Math.round(b / 1048576) + ' MB';
+}
+function fileInfo(file) {
+  const f = safeDecode(file);
+  const res = (f.match(/2160p|4k|1080p|720p|480p/i) || [''])[0].toLowerCase().replace('4k', '2160p');
+  let src = '';
+  if (/blu[ ._-]?ray|brrip|bdrip/i.test(f)) src = 'BluRay';
+  else if (/web[ ._-]?dl/i.test(f)) src = 'WEB-DL';
+  else if (/webrip/i.test(f)) src = 'WEBRip';
+  else if (/hdrip/i.test(f)) src = 'HDRip';
+  else if (/hdtv/i.test(f)) src = 'HDTV';
+  else if (/dvdrip/i.test(f)) src = 'DVDRip';
+  else if (/hdcam|(^|[^a-z])cam([^a-z]|$)/i.test(f)) src = 'CAM';
+  const codec = /x265|hevc|h[ .]?265/i.test(f) ? 'HEVC' : /x264|h[ .]?264|avc/i.test(f) ? 'x264' : '';
+  const hdr = /hdr|dolby[ ._-]?vision/i.test(f) ? 'HDR' : '';
+  return { res, src, codec, hdr, rank: { '2160p': 4, '1080p': 3, '720p': 2, '480p': 1 }[res] || 0 };
 }
 
 async function streams(type, rawId) {
@@ -382,12 +519,20 @@ async function streams(type, rawId) {
     const s = parseInt(parts[2], 10), ep = parseInt(parts[3], 10);
     list2 = (await showEpisodes(e)).filter((x) => x.season === s && x.episode === ep);
   } else list2 = await movieFiles(e);
+  const rows = list2.map((x) => ({ x, i: fileInfo(x.file), size: sizeOf.get(x.url) || 0 }));
+  rows.sort((a, b) => b.i.rank - a.i.rank || b.size - a.size);   // best quality first
   return {
-    streams: list2.slice(0, 15).map((x) => ({
-      name: 'ISP Server' + (quality(x.file) ? '\n' + quality(x.file) : ''),
-      title: x.file,
-      url: x.url
-    }))
+    streams: rows.slice(0, 15).map(({ x, i, size }) => {
+      const top = [i.res, fmtSize(size)].filter(Boolean).join(' · ');
+      const more = [i.src, i.codec, i.hdr].filter(Boolean).join(' · ');
+      const st = {
+        name: 'ISP Server' + (top ? '\n' + top : ''),
+        title: x.file + (more ? '\n' + more : ''),
+        url: x.url
+      };
+      if (x.subs && x.subs.length) st.subtitles = x.subs;
+      return st;
+    })
   };
 }
 
@@ -416,6 +561,13 @@ async function exportSite(outDir) {
   // optional: CATS="Hollywood,Korean" exports only those folders (smaller, faster)
   const only = (process.env.CATS || '').split(',').map((x) => x.trim()).filter(Boolean);
   if (only.length) { index = index.filter((e) => only.indexOf(e.cat) >= 0); console.log('Only these folders: ' + only.join(', ') + ' (' + index.length + ' titles)'); }
+  // optional: MIN_YEAR=2018 handles only titles from that year on (much faster)
+  const minYear = parseInt(process.env.MIN_YEAR || '0', 10);
+  const allIndex = index;
+  const maxYear = parseInt(process.env.MAX_YEAR || '0', 10);   // optional: MAX_YEAR=2024 stops at that year
+  const inRange = (e) => { const y = parseInt(e.year, 10) || 0; return y >= minYear && (!maxYear || y <= maxYear); };
+  const todoSet = (minYear || maxYear) ? new Set(index.filter(inRange).map((e) => e.id)) : null;
+  if (todoSet) console.log('Only titles from ' + (minYear || 'the start') + (maxYear ? ' to ' + maxYear : ' on') + ': ' + todoSet.size + ' of ' + index.length);
   const w = (rel, obj) => {
     const f = path.join(outDir, rel);
     fs.mkdirSync(path.dirname(f), { recursive: true });
@@ -429,31 +581,46 @@ async function exportSite(outDir) {
   // catalog pages
   for (const c of man.catalogs) {
     const cat = c.id.replace('dm-' + c.type + '-', '');
-    const items = index.filter((e) => e.type === c.type && e.cat === cat)
-      .sort((a, b) => (b.year || '0').localeCompare(a.year || '0') || a.name.localeCompare(b.name));
+    const items = catItems(c.type, cat);
     const pages = Math.max(1, Math.ceil(items.length / CFG.pageSize));
     for (let n = 0; n < pages; n++) {
-      const metas = items.slice(n * CFG.pageSize, (n + 1) * CFG.pageSize).map(toMeta);
+      const metas = items.slice(n * CFG.pageSize, (n + 1) * CFG.pageSize).map((e) => toMeta(e));
       const rel = n === 0 ? 'catalog/' + c.type + '/' + c.id + '.json' : 'catalog/' + c.type + '/' + c.id + '/skip=' + (n * CFG.pageSize) + '.json';
       w(rel, { metas });
     }
   }
   // list of every title, for the search service
-  w('search-index.json', index.map((e) => [e.id, e.type, e.name, e.year || '', String(e.poster || '').replace('https://image.tmdb.org/t/p/w342', ''), e.cat]));
+  w('search-index.json', index.map((e) => [e.id, e.type, e.name, e.year || '', String(e.poster || '').replace('https://image.tmdb.org/t/p/w342', ''), e.cat, e.det && e.det.rating ? +e.det.rating : 0, e.det ? e.det.genres.join('|') : '', e.tid || 0, e.added || 0]));
   console.log('Catalog pages written. Now reading every title for episodes and files...');
   let i = 0, done = 0;
-  const total = index.length;
+  const total = todoSet ? todoSet.size : index.length, t0 = Date.now();
   async function one() {
-    while (i < total) {
+    while (i < index.length) {
       const e = index[i++];
+      if (todoSet && !todoSet.has(e.id)) continue;
       const mf = path.join(outDir, 'meta', e.type, e.id + '.json');
+      if (process.env.SUBS && fs.existsSync(mf)) {
+        // streams-only pass: rewrite the stream files (subtitles, quality, size)
+        try {
+          const wr = (rel, o) => { if (o.streams.length) w(rel, o); };
+          if (e.type === 'movie') wr('stream/movie/' + e.id + '.json', await streams('movie', e.id));
+          else {
+            const j = JSON.parse(fs.readFileSync(mf, 'utf8'));
+            for (const v of ((j.meta && j.meta.videos) || [])) wr('stream/series/' + v.id + '.json', await streams('series', v.id));
+            showCache.delete(e.id);
+          }
+        } catch (err) {}
+        done++;
+        if (done % 25 === 0) { const el = (Date.now() - t0) / 1000; console.log(done + ' / ' + total + ' titles done, about ' + Math.round((total - done) * el / done / 60) + ' minutes left'); }
+        continue;
+      }
       if (!process.env.REFRESH && fs.existsSync(mf)) {
         // already exported: only refresh the picture and description
         try {
           const j = JSON.parse(fs.readFileSync(mf, 'utf8'));
           if (j && j.meta) {
-            j.meta.poster = e.poster || undefined; j.meta.background = e.background || undefined;
-            if (e.description) j.meta.description = e.description;
+            Object.assign(j.meta, toMeta(e, true));
+            if (e.type === 'series' && e.tid && j.meta.videos && !j.meta.videos.some((v) => v.thumbnail || v.overview)) await enrichVideos(j.meta, e);
             fs.writeFileSync(mf, JSON.stringify(j));
           }
         } catch (err) {}
@@ -469,7 +636,7 @@ async function exportSite(outDir) {
         }
       } catch (err) { console.log('skipped ' + e.name + ': ' + (err.message || err)); }
       done++;
-      if (done % 100 === 0) console.log(done + ' / ' + total + ' titles done');
+      if (done % 25 === 0) { const el = (Date.now() - t0) / 1000; console.log(done + ' / ' + total + ' titles done, about ' + Math.round((total - done) * el / done / 60) + ' minutes left'); }
     }
   }
   await Promise.all(Array.from({ length: CFG.parallel }, one));
@@ -495,10 +662,33 @@ if (process.argv[2] === 'posters') {
     console.log('Finished. Posters found: ' + found + ' of ' + todo.length);
     process.exit(0);
   })();
+} else if (process.argv[2] === 'update') {
+  // one command: look for new titles, export them, and upload to GitHub
+  const out = process.argv[3] || 'site';
+  loadIndex();
+  (async () => {
+    console.log('Looking for new titles on the server...');
+    await buildIndex(true);
+    console.log('Titles in list: ' + index.length + '. New since last time: ' + (state.newCount || 0));
+    if (state.error) console.log('Note: ' + state.error);
+    await exportSite(out);
+    if (process.argv[4] !== 'nopush') {
+      const { execSync } = require('child_process');
+      const run = (c, cwd) => { try { console.log('> ' + c); execSync(c, { cwd, stdio: 'inherit' }); return true; } catch (err) { return false; } };
+      let top;
+      try { top = execSync('git rev-parse --show-toplevel', { cwd: path.resolve(out) }).toString().trim(); } catch (err) { console.log('The folder ' + out + ' is not inside a git repository, so nothing was uploaded.'); process.exit(0); }
+      run('git add -A', top);
+      run('git commit -m "update titles"', top);
+      run('git pull --no-rebase --no-edit', top);
+      console.log(run('git push', top) ? 'Uploaded. Wait about a minute, then open Nuvio.' : 'Upload failed. Run: cd ' + top + ' and then git push');
+    }
+    process.exit(0);
+  })();
 } else if (process.argv[2] === 'export') {
   const out = process.argv[3] || 'site';
   const at = loadIndex();
   (async () => {
+    if (process.argv[4] === 'streams' || process.argv[4] === 'subs') process.env.SUBS = '1';
     if (!index.length || process.argv[4] === 'refresh') {
       console.log('Reading the server to build the list first...');
       await buildIndex();
