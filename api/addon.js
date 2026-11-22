@@ -14,7 +14,7 @@ const LABEL = { Indian_Bangla: 'Bengali', Others_Language: 'Others', IMDB_TOP_25
 const catLabel = (c) => LABEL[c] || String(c || '').replace(/_/g, ' ');
 
 function norm(s) {
-  return String(s || '').toLowerCase().replace(/['’`]/g, '').replace(/&/g, ' ').replace(/[^a-z0-9]+/g, ' ').trim();
+  return String(s || '').toLowerCase().replace(/['’`]/g, '').replace(/&/g, ' ').replace(/[^\p{L}\p{M}\p{N}]+/gu, ' ').trim();
 }
 
 async function loadIndex() {
@@ -28,8 +28,9 @@ async function loadIndex() {
     return {
       id: x[0], type: x[1], name: x[2], year: x[3], poster: x[4], cat: x[5],
       rating: x[6] || 0, genres, tid: x[8] || 0, added: x[9] || 0,
-      key: nameKey, nameTokens: nameKey.split(' '),
-      full: norm(x[2] + ' ' + x[3] + ' ' + genres.join(' ') + ' ' + catLabel(x[5]))
+      alt: x[10] || '', coll: x[11] || '', runtime: x[12] || 0, complete: x[13],
+      key: nameKey, nameTokens: nameKey.split(' ').concat(norm(x[10] || '').split(' ')).filter(Boolean),
+      full: norm(x[2] + ' ' + x[3] + ' ' + genres.join(' ') + ' ' + catLabel(x[5]) + ' ' + (x[10] || '') + ' ' + (x[11] || ''))
     };
   });
   cache = { at: Date.now(), items };
@@ -103,6 +104,12 @@ async function trending(type) {
   return ids;
 }
 
+function collectionList(items) {
+  const n = {};
+  items.forEach((e) => { if (e.type === 'movie' && e.coll) n[e.coll] = (n[e.coll] || 0) + 1; });
+  return Object.keys(n).filter((k) => n[k] >= 2).sort((a, b) => n[b] - n[a] || a.localeCompare(b)).slice(0, 120);
+}
+
 function genreList(items) {
   const n = {};
   items.forEach((e) => e.genres.forEach((g) => { n[g] = (n[g] || 0) + 1; }));
@@ -111,7 +118,7 @@ function genreList(items) {
 
 async function smart(kind, type, extra) {
   let items = (await loadIndex()).filter((e) => e.type === type);
-  if (extra.genre) items = items.filter((e) => e.genres.indexOf(extra.genre) >= 0);
+  if (extra.genre && kind !== 'coll') items = items.filter((e) => e.genres.indexOf(extra.genre) >= 0);
   const skip = parseInt(extra.skip || '0', 10) || 0;
   let list;
   if (kind === 'top') {
@@ -125,6 +132,12 @@ async function smart(kind, type, extra) {
     const pool = items.filter((e) => e.poster);
     list = [];
     for (let i = 0; i < 40 && pool.length; i++) list.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+  } else if (kind === 'coll') {   // franchises: films grouped by collection, optional collection name as "genre"
+    list = items.filter((e) => e.coll && (!extra.genre || e.coll === extra.genre))
+      .sort((a, b) => a.coll.localeCompare(b.coll) || (a.year || '0').localeCompare(b.year || '0'));
+    return { metas: list.slice(skip, skip + PAGE).map((e) => { const m = toMeta(e); m.genres = [e.coll].concat(m.genres); return m; }) };
+  } else if (kind === 'complete') {
+    list = items.filter((e) => e.complete === 1).sort((a, b) => b.rating - a.rating || (b.year || '0').localeCompare(a.year || '0'));
   } else {   // all
     list = items.slice().sort((a, b) => (b.year || '0').localeCompare(a.year || '0') || a.name.localeCompare(b.name));
   }
@@ -165,8 +178,8 @@ async function manifest() {
   const r = await fetch(PAGES + '/manifest.json');
   if (!r.ok) throw new Error('manifest.json not found (' + r.status + ')');
   const m = await r.json();
-  let genres = [];
-  try { genres = genreList(await loadIndex()); } catch (e) {}
+  let genres = [], colls = [];
+  try { const all = await loadIndex(); genres = genreList(all); colls = collectionList(all); } catch (e) {}
   const skip = { name: 'skip', isRequired: false };
   const gen = genres.length ? [{ name: 'genre', options: genres, isRequired: false }, skip] : [skip];
   const mk = (id, name, extra) => ['movie', 'series'].map((t) => ({ type: t, id: 'dm-' + id + '-' + t, name, extra }));
@@ -176,6 +189,8 @@ async function manifest() {
     .concat(mk('trend', 'Dhaka Trending', [skip]))
     .concat(mk('top', 'Dhaka Top Rated', gen))
     .concat(mk('pick', 'Dhaka Random Picks', []))
+    .concat([{ type: 'movie', id: 'dm-coll-movie', name: 'Dhaka Franchises', extra: colls.length ? [{ name: 'genre', options: colls, isRequired: false }, skip] : [skip] }])
+    .concat([{ type: 'series', id: 'dm-complete-series', name: 'Dhaka Complete Series', extra: [skip] }])
     .concat(old.filter((c) => !isNew(c)))
     .concat(mk('all', 'Dhaka All', gen))
     .concat([
@@ -183,7 +198,7 @@ async function manifest() {
       { type: 'series', id: 'dm-search-series', name: 'Dhaka Search', extra: [{ name: 'search', isRequired: true }] }
     ]);
   m.resources = ['catalog', 'meta', 'stream', 'subtitles'];
-  m.version = '3.1.0';
+  m.version = '3.2.0';
   m.description = 'Every movie and series on server1.dhakamovie.com, with search, trending, top rated and genres.';
   return m;
 }
@@ -228,7 +243,7 @@ module.exports = async (req, res) => {
     if (seg[0] === 'catalog') {
       const extra = parseExtra(seg.slice(3).join('/'));
       if (/^dm-search-/.test(seg[2] || '')) return send(200, await search(seg[1], extra.search || ''), 60);
-      const m = /^dm-(top|trend|pick|all)-(movie|series)$/.exec(seg[2] || '');
+      const m = /^dm-(top|trend|pick|all|coll|complete)-(movie|series)$/.exec(seg[2] || '');
       if (m) return send(200, await smart(m[1], seg[1], extra), m[1] === 'pick' ? 0 : 600);
     }
     if (seg[0] === 'subtitles') return send(200, await subtitles(seg[1], (seg[2] || '').replace(/\.json$/, '')), 86400);
