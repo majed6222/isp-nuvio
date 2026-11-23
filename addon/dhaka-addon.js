@@ -278,7 +278,15 @@ async function buildIndex(incremental) {
   state.crawling = false; state.finished = Date.now();
 }
 
+// real audio languages found by "probe": url -> ['Hindi','English'] (series: one entry per folder, key 'dir:<folder url>')
+const AUDIO_FILE = process.env.AUDIO_FILE || path.join(__dirname, 'dhaka-audio.json');
+let audioMap = {};
+function loadAudio() { try { audioMap = JSON.parse(fs.readFileSync(AUDIO_FILE, 'utf8')); } catch (e) { audioMap = {}; } }
+function saveAudio() { try { fs.writeFileSync(AUDIO_FILE, JSON.stringify(audioMap)); } catch (e) {} }
+const audioFor = (url) => audioMap[url] || audioMap['dir:' + String(url).replace(/[^\/]*$/, '')] || null;
+
 function loadIndex() {
+  loadAudio();
   try {
     const j = JSON.parse(fs.readFileSync(CFG.indexFile, 'utf8'));
     index = j.items || []; byId = {};
@@ -380,6 +388,71 @@ async function movieFiles(entry) {
   const subs = await movieSubs(entry);
   out.forEach((f) => { f.subs = pickSubs(subs, f.file, null, null, false, out.length); });
   return out;
+}
+
+// ---------- probe: real audio tracks with ffprobe ----------
+const { execFile } = require('child_process');
+const ISO3 = { hin: 'Hindi', eng: 'English', ben: 'Bengali', bng: 'Bengali', tam: 'Tamil', tel: 'Telugu', mal: 'Malayalam', kan: 'Kannada', kor: 'Korean', tur: 'Turkish', jpn: 'Japanese', zho: 'Chinese', chi: 'Chinese', urd: 'Urdu', pan: 'Punjabi', mar: 'Marathi', spa: 'Spanish', fre: 'French', fra: 'French', ger: 'German', deu: 'German', ita: 'Italian', rus: 'Russian', tha: 'Thai', ara: 'Arabic', ind: 'Indonesian', por: 'Portuguese' };
+function haveFfprobe() { return new Promise((r) => execFile('ffprobe', ['-version'], { timeout: 10000 }, (err) => r(!err))); }
+function probeFile(url) {
+  return new Promise((resolve) => {
+    execFile('ffprobe', ['-v', 'error', '-rw_timeout', '20000000', '-select_streams', 'a', '-show_entries', 'stream=index:stream_tags=language,title', '-of', 'json', url],
+      { timeout: 60000, maxBuffer: 2000000 }, (err, out) => {
+        if (err) return resolve(null);
+        try {
+          const langs = [];
+          (JSON.parse(out).streams || []).forEach((st) => {
+            const t = st.tags || {};
+            let name = ISO3[String(t.language || '').toLowerCase()];
+            if (!name && t.title) { const w = safeDecode(t.title).toLowerCase(); const hit = AUDIO_WORDS.find(([, re]) => new RegExp('\\b(?:' + re + ')\\b').test(w)); if (hit) name = hit[0]; }
+            if (name && langs.indexOf(name) < 0) langs.push(name);
+          });
+          resolve(langs);
+        } catch (e) { resolve(null); }
+      });
+  });
+}
+async function probeTitles(titles) {
+  // 1. collect the video links (movies: every file; series: two episodes of each folder)
+  const jobs = [];   // { url, dir }
+  let ti = 0;
+  await Promise.all(Array.from({ length: 8 }, async () => {
+    while (ti < titles.length) {
+      const e = titles[ti++];
+      try {
+        if (e.type === 'movie') (await movieFiles(e)).forEach((f) => { if (!(f.url in audioMap)) jobs.push({ url: f.url }); });
+        else {
+          const byDir = {};
+          (await showEpisodes(e)).forEach((x) => { const d = x.url.replace(/[^\/]*$/, ''); (byDir[d] = byDir[d] || []).push(x.url); });
+          Object.keys(byDir).forEach((d) => { if (!(('dir:' + d) in audioMap)) jobs.push({ dir: d, urls: byDir[d].sort() }); });
+        }
+      } catch (err) {}
+    }
+  }));
+  console.log('Files to check: ' + jobs.length);
+  let i = 0, done = 0; const t0 = Date.now();
+  await Promise.all(Array.from({ length: parseInt(process.env.PROBE_PARALLEL || '4', 10) }, async () => {
+    while (i < jobs.length) {
+      const j = jobs[i++];
+      if (j.dir) {
+        // one folder of episodes: check the first and the last; if they agree, the folder gets one answer, otherwise every episode is checked
+        const a = await probeFile(j.urls[0]);
+        const b = j.urls.length > 1 ? await probeFile(j.urls[j.urls.length - 1]) : a;
+        if (a && b && a.join() === b.join()) audioMap['dir:' + j.dir] = a;
+        else for (const u of j.urls) { const r = await probeFile(u); if (r) audioMap[u] = r; }
+      } else {
+        const r = await probeFile(j.url);
+        if (r) audioMap[j.url] = r;
+      }
+      done++;
+      if (done % 20 === 0) {
+        saveAudio();
+        const el = (Date.now() - t0) / 1000;
+        console.log(done + ' / ' + jobs.length + ' checked, about ' + Math.round((jobs.length - done) * el / done / 60) + ' minutes left');
+      }
+    }
+  }));
+  saveAudio();
 }
 
 // ---------- Stremio endpoints ----------
@@ -566,7 +639,7 @@ function originLang(e) {
   const l = e && e.det && e.det.lang;
   return (l && ISO_LANG[l]) || (e && FOLDER_LANG[e.cat]) || '';
 }
-function audioInfo(file, e) {
+function audioInfo(file, e, known) {
   let f = ' ' + safeDecode(file).replace(/\.(mkv|mp4|avi|webm|ts|mov)$/i, '').replace(/[._\-+,&()\[\]{}]+/g, ' ').toLowerCase() + ' ';
   f = f.replace(/\b(?:(?:english|eng|hindi|hin|bangla|bengali|arabic|multi)\s+)?(?:e\s?)?subs?(?:titles?)?\b/g, ' ');   // "English ESubs" are subtitles, not audio
   const tags = [];
@@ -574,14 +647,16 @@ function audioInfo(file, e) {
   const origin = originLang(e);
   const audio = tags.slice();
   if (/\b(?:dual|multi)\b/.test(f)) [origin, 'Hindi'].forEach((l) => { if (l && audio.indexOf(l) < 0) audio.push(l); });
-  if (!audio.length && origin) audio.push(origin);          // no language in the name: the original audio
+  const named = audio.length > 0;                            // the file name claims a language
+  if (known && known.length) { audio.length = 0; known.forEach((l) => audio.push(l)); }   // real tracks found by "probe" win
+  else if (!audio.length && origin) audio.push(origin);     // no language in the name: the original audio
   const dub = /\bdub(?:bed)?\b/.test(f) || (!!origin && audio.length > 0 && audio.indexOf(origin) < 0);
-  return { audio, origin, dub };
+  return { audio, origin, dub, named: named && !(known && known.length) };
 }
-function labelStream(file, sizeText, e) {
-  const i = fileInfo(file), a = audioInfo(file, e);
+function labelStream(file, sizeText, e, url) {
+  const i = fileInfo(file), a = audioInfo(file, e, url ? audioFor(url) : null);
   const top = [i.res, sizeText].filter(Boolean).join(' \u00b7 ');
-  const au = a.audio.length ? a.audio.join(' + ') + (a.dub ? ' (dub)' : '') : 'Original audio';
+  const au = a.audio.length ? a.audio.join(' + ') + (a.dub ? ' (dub)' : '') + (a.named ? ' (per name)' : '') : 'Original audio';
   const note = [a.origin && a.audio.length && a.audio.indexOf(a.origin) < 0 ? 'Original: ' + a.origin : '', i.src, i.codec, i.hdr].filter(Boolean).join(' \u00b7 ');
   return { name: 'ISP Server' + (top ? '\n' + top : '') + '\n' + au, title: file + (note ? '\n' + note : '') };
 }
@@ -600,7 +675,7 @@ async function streams(type, rawId) {
   rows.sort((a, b) => b.i.rank - a.i.rank || b.size - a.size);   // best quality first
   return {
     streams: rows.slice(0, 15).map(({ x, i, size }) => {
-      const st = Object.assign({}, labelStream(x.file, fmtSize(size), e), { url: x.url });
+      const st = Object.assign({}, labelStream(x.file, fmtSize(size), e, x.url), { url: x.url });
       if (x.subs && x.subs.length) st.subtitles = x.subs;
       return st;
     })
@@ -746,6 +821,18 @@ if (process.argv[2] === 'posters') {
     console.log('Finished. Posters found: ' + found + ' of ' + todo.length);
     process.exit(0);
   })();
+} else if (process.argv[2] === 'probe') {
+  // reads the real audio tracks of the videos (needs ffprobe: pkg install ffmpeg). MIN_YEAR / MAX_YEAR choose the titles.
+  loadIndex();
+  const minY = parseInt(process.env.MIN_YEAR || '0', 10), maxY = parseInt(process.env.MAX_YEAR || '0', 10);
+  const titles = index.filter((e) => { const y = parseInt(e.year, 10) || 0; return y >= minY && (!maxY || y <= maxY); });
+  (async () => {
+    if (!(await haveFfprobe())) { console.log('ffprobe was not found. Run:  pkg install ffmpeg   and then try again.'); process.exit(1); }
+    console.log('Titles in range: ' + titles.length + ' of ' + index.length);
+    await probeTitles(titles);
+    console.log('Finished. Now run the relabel command.');
+    process.exit(0);
+  })();
 } else if (process.argv[2] === 'details') {
   // fills in cast photos, trailers, franchise, seasons and original language for titles that already have a TMDB match
   loadIndex();
@@ -788,7 +875,7 @@ if (process.argv[2] === 'posters') {
         (j.streams || []).forEach((st) => {
           const file = String(st.title || '').split('\n')[0];
           const size = (String(st.name || '').match(/\d+(?:\.\d+)? (?:GB|MB)/) || [''])[0];
-          const lab = labelStream(file, size, e);
+          const lab = labelStream(file, size, e, st.url);
           if (lab.name !== st.name || lab.title !== st.title) { st.name = lab.name; st.title = lab.title; c = true; }
         });
         if (c) { fs.writeFileSync(fp, JSON.stringify(j)); changed++; }
@@ -808,6 +895,10 @@ if (process.argv[2] === 'posters') {
     await buildIndex(true);
     console.log('Titles in list: ' + index.length + '. New since last time: ' + (state.newCount || 0));
     if (state.error) console.log('Note: ' + state.error);
+    if (state.newCount && await haveFfprobe()) {
+      console.log('Checking the audio tracks of the new titles...');
+      await probeTitles(index.filter((e) => e.added && Date.now() - e.added < 6 * 3600 * 1000));
+    }
     await exportSite(out);
     if (process.argv[4] !== 'nopush') {
       const { execSync } = require('child_process');
