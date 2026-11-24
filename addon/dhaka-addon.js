@@ -160,6 +160,65 @@ async function getJson(url) {
 }
 const yearNum = (d) => parseInt(String(d || '').slice(0, 4), 10) || 0;
 
+// everything extra we keep for one title: rating, genres, cast with photos, trailers, franchise, seasons, original language
+async function fetchDetails(e, kind, id) {
+  const more = kind === 'tv' ? 'content_ratings' : 'release_dates';
+  const d = await getJson('https://api.themoviedb.org/3/' + kind + '/' + id + '?api_key=' + CFG.tmdbKey + '&append_to_response=credits,videos,external_ids,recommendations,' + more);
+  if (!d || d.status_code) return false;
+  const crew = (d.credits && d.credits.crew) || [];
+  const cast = (d.credits && d.credits.cast) || [];
+  const title = d.title || d.name || '', orig = d.original_title || d.original_name || '';
+  const seasons = {};
+  (d.seasons || []).forEach((x) => { if (x.season_number > 0 && x.episode_count) seasons[x.season_number] = x.episode_count; });
+  // videos: trailers first, then teasers, clips, featurettes, behind the scenes
+  const ORDER = ['Trailer', 'Teaser', 'Clip', 'Featurette', 'Behind the Scenes', 'Bloopers'];
+  const vids = ((d.videos && d.videos.results) || []).filter((v) => v.site === 'YouTube' && v.key && ORDER.indexOf(v.type) >= 0);
+  vids.sort((a, b) => ORDER.indexOf(a.type) - ORDER.indexOf(b.type) || (b.official ? 1 : 0) - (a.official ? 1 : 0));
+  // age certification
+  let cert = '';
+  const rs = kind === 'tv' ? ((d.content_ratings && d.content_ratings.results) || []) : ((d.release_dates && d.release_dates.results) || []);
+  for (const cc of ['US', 'GB', 'IN']) {
+    const r = rs.find((x) => x.iso_3166_1 === cc);
+    if (!r) continue;
+    cert = kind === 'tv' ? (r.rating || '') : ((r.release_dates || []).map((x) => x.certification).find(Boolean) || '');
+    if (cert) break;
+  }
+  const dir = kind === 'tv' ? [] : crew.filter((c) => c.job === 'Director');
+  const writers = [];
+  crew.filter((c) => ['Writer', 'Screenplay', 'Story', 'Novel', 'Creator'].indexOf(c.job) >= 0).forEach((c) => { if (writers.indexOf(c.name) < 0) writers.push(c.name); });
+  const byTv = (d.created_by || []);
+  const prevOmdb = e.det && e.det.omdb;
+  e.det = {
+    v: 3,
+    rating: d.vote_average ? d.vote_average.toFixed(1) : '',
+    genres: (d.genres || []).map((g) => g.name).slice(0, 4),
+    runtime: d.runtime || (d.episode_run_time && d.episode_run_time[0]) || 0,
+    tagline: d.tagline || '',
+    cast: cast.slice(0, 8).map((c) => c.name),
+    castFull: cast.slice(0, 10).map((c) => [c.name, c.character || '', c.profile_path || '']),
+    director: (kind === 'tv' ? byTv.map((c) => c.name) : dir.map((c) => c.name)).slice(0, 2),
+    directorFull: (kind === 'tv' ? byTv : dir).slice(0, 2).map((c) => [c.name, c.profile_path || '']),
+    writers: writers.slice(0, 3),
+    released: d.release_date || d.first_air_date || '',
+    status: d.status || '',
+    cert,
+    countries: ((d.production_countries || []).map((c) => c.name)).concat(d.production_countries && d.production_countries.length ? [] : (d.origin_country || [])).slice(0, 3),
+    studios: (d.production_companies || []).slice(0, 3).map((c) => c.name),
+    networks: (d.networks || []).slice(0, 2).map((n) => n.name),
+    lang: d.original_language || '',
+    imdb: (d.external_ids && d.external_ids.imdb_id) || '',
+    videos: vids.slice(0, 8).map((v) => [v.key, v.type, v.name || '']),
+    trailers: vids.filter((v) => v.type === 'Trailer').slice(0, 2).map((v) => v.key),
+    collection: d.belongs_to_collection ? { id: d.belongs_to_collection.id, name: d.belongs_to_collection.name } : null,
+    rec: ((d.recommendations && d.recommendations.results) || []).slice(0, 20).map((r) => r.id),
+    alt: orig && orig !== title ? [orig] : [],      // for Bengali films this is the Bengali-script title
+    seasons
+  };
+  if (prevOmdb) e.det.omdb = prevOmdb;
+  if (d.overview) e.description = d.overview;
+  return true;
+}
+
 // A poster is used only when the title matches and the year fits. No poster is better than a wrong one.
 async function tmdbPoster(e) {
   e.posterTried = true;
@@ -190,21 +249,7 @@ async function tmdbPoster(e) {
     e.background = h.backdrop_path ? 'https://image.tmdb.org/t/p/w780' + h.backdrop_path : '';
     e.description = h.overview || '';
     e.tid = h.id;
-    // rating, genres, cast, director, runtime
-    const d = await getJson('https://api.themoviedb.org/3/' + kind + '/' + h.id + '?api_key=' + CFG.tmdbKey + '&append_to_response=credits');
-    if (d && !d.status_code) {
-      const crew = (d.credits && d.credits.crew) || [];
-      e.det = {
-        rating: d.vote_average ? d.vote_average.toFixed(1) : '',
-        genres: (d.genres || []).map((g) => g.name).slice(0, 4),
-        runtime: d.runtime || (d.episode_run_time && d.episode_run_time[0]) || 0,
-        tagline: d.tagline || '',
-        cast: ((d.credits && d.credits.cast) || []).slice(0, 8).map((c) => c.name),
-        director: (kind === 'tv' ? (d.created_by || []).map((c) => c.name) : crew.filter((c) => c.job === 'Director').map((c) => c.name)).slice(0, 2),
-        released: d.release_date || d.first_air_date || ''
-      };
-      if (d.overview) e.description = d.overview;
-    }
+    await fetchDetails(e, kind, h.id);
     return;
   }
   // second source for series: TVmaze (no key needed)
@@ -261,7 +306,15 @@ async function buildIndex(incremental) {
   state.crawling = false; state.finished = Date.now();
 }
 
+// real audio languages found by "probe": url -> ['Hindi','English'] (series: one entry per folder, key 'dir:<folder url>')
+const AUDIO_FILE = process.env.AUDIO_FILE || path.join(__dirname, 'dhaka-audio.json');
+let audioMap = {};
+function loadAudio() { try { audioMap = JSON.parse(fs.readFileSync(AUDIO_FILE, 'utf8')); } catch (e) { audioMap = {}; } }
+function saveAudio() { try { fs.writeFileSync(AUDIO_FILE, JSON.stringify(audioMap)); } catch (e) {} }
+const audioFor = (url) => audioMap[url] || audioMap['dir:' + String(url).replace(/[^\/]*$/, '')] || null;
+
 function loadIndex() {
+  loadAudio();
   try {
     const j = JSON.parse(fs.readFileSync(CFG.indexFile, 'utf8'));
     index = j.items || []; byId = {};
@@ -365,6 +418,74 @@ async function movieFiles(entry) {
   return out;
 }
 
+// ---------- probe: real audio tracks with ffprobe ----------
+const { execFile } = require('child_process');
+const ISO3 = { hin: 'Hindi', eng: 'English', ben: 'Bengali', bng: 'Bengali', tam: 'Tamil', tel: 'Telugu', mal: 'Malayalam', kan: 'Kannada', kor: 'Korean', tur: 'Turkish', jpn: 'Japanese', zho: 'Chinese', chi: 'Chinese', urd: 'Urdu', pan: 'Punjabi', mar: 'Marathi', spa: 'Spanish', fre: 'French', fra: 'French', ger: 'German', deu: 'German', ita: 'Italian', rus: 'Russian', tha: 'Thai', ara: 'Arabic', ind: 'Indonesian', por: 'Portuguese' };
+function haveFfprobe() { return new Promise((r) => execFile('ffprobe', ['-version'], { timeout: 10000 }, (err) => r(!err))); }
+const probeFail = { n: 0, last: '' };
+function probeFile(url) {
+  return new Promise((resolve) => {
+    execFile('ffprobe', ['-v', 'error', '-rw_timeout', '20000000', '-select_streams', 'a', '-show_entries', 'stream=index:stream_tags=language,title', '-of', 'json', url],
+      { timeout: 60000, maxBuffer: 2000000 }, (err, out, stderr) => {
+        if (err) { probeFail.n++; probeFail.last = String((stderr || err.message || err)).split('\n')[0].slice(0, 160); return resolve(null); }
+        try {
+          const langs = [];
+          (JSON.parse(out).streams || []).forEach((st) => {
+            const t = st.tags || {};
+            let name = ISO3[String(t.language || '').toLowerCase()];
+            if (!name && t.title) { const w = safeDecode(t.title).toLowerCase(); const hit = AUDIO_WORDS.find(([, re]) => new RegExp('\\b(?:' + re + ')\\b').test(w)); if (hit) name = hit[0]; }
+            if (name && langs.indexOf(name) < 0) langs.push(name);
+          });
+          resolve(langs);
+        } catch (e) { resolve(null); }
+      });
+  });
+}
+async function probeTitles(titles) {
+  // 1. collect the video links (movies: every file; series: two episodes of each folder)
+  const jobs = [];   // { url, dir }
+  let ti = 0;
+  await Promise.all(Array.from({ length: 8 }, async () => {
+    while (ti < titles.length) {
+      const e = titles[ti++];
+      try {
+        if (e.type === 'movie') (await movieFiles(e)).forEach((f) => { if (!(f.url in audioMap)) jobs.push({ url: f.url }); });
+        else {
+          const byDir = {};
+          (await showEpisodes(e)).forEach((x) => { const d = x.url.replace(/[^\/]*$/, ''); (byDir[d] = byDir[d] || []).push(x.url); });
+          Object.keys(byDir).forEach((d) => { if (!(('dir:' + d) in audioMap)) jobs.push({ dir: d, urls: byDir[d].sort() }); });
+        }
+      } catch (err) {}
+    }
+  }));
+  console.log('Files to check: ' + jobs.length);
+  let i = 0, done = 0; const t0 = Date.now();
+  await Promise.all(Array.from({ length: parseInt(process.env.PROBE_PARALLEL || '4', 10) }, async () => {
+    while (i < jobs.length) {
+      const j = jobs[i++];
+      if (j.dir) {
+        // one folder of episodes: check the first and the last; if they agree, the folder gets one answer, otherwise every episode is checked
+        const a = await probeFile(j.urls[0]);
+        const b = j.urls.length > 1 ? await probeFile(j.urls[j.urls.length - 1]) : a;
+        if (a && b && a.join() === b.join()) audioMap['dir:' + j.dir] = a;
+        else for (const u of j.urls) { const r = await probeFile(u); if (r) audioMap[u] = r; }
+      } else {
+        const r = await probeFile(j.url);
+        if (r) audioMap[j.url] = r;
+      }
+      done++;
+      if (done % 20 === 0) {
+        saveAudio();
+        const el = (Date.now() - t0) / 1000;
+        console.log(done + ' / ' + jobs.length + ' checked, about ' + Math.round((jobs.length - done) * el / done / 60) + ' minutes left');
+      }
+    }
+  }));
+  saveAudio();
+  console.log('Saved audio info for ' + Object.keys(audioMap).length + ' entries in ' + AUDIO_FILE);
+  if (probeFail.n) console.log('Could not read ' + probeFail.n + ' files. Last problem: ' + probeFail.last);
+}
+
 // ---------- Stremio endpoints ----------
 const CAT_ORDER = ['Hollywood', 'Bollywood', 'Korean', 'Indian_Bangla', 'South_Indian', 'English', 'Hindi', 'Animation', 'Animes', 'Turkish', 'IMDB_TOP_250', 'Others_Language'];
 const CAT_LABEL = { Indian_Bangla: 'Bengali', Others_Language: 'Others', IMDB_TOP_250: 'IMDb Top 250', South_Indian: 'South Indian' };
@@ -408,6 +529,17 @@ function parseExtra(s) {
   return o;
 }
 
+let tidMap = null;
+function similarOf(e) {
+  if (!e.det || !e.det.rec || !e.det.rec.length) return [];
+  if (!tidMap) { tidMap = new Map(); index.forEach((x) => { if (x.tid) tidMap.set(x.type + ':' + x.tid, x); }); }
+  const out = [];
+  e.det.rec.forEach((t) => { const x = tidMap.get(e.type + ':' + t); if (x && x.id !== e.id && out.length < 8) out.push(x); });
+  return out;
+}
+const fmtDate = (d) => { const t = new Date(d); return isNaN(t) ? d : t.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }); };
+const srch = (q) => 'stremio:///search?search=' + encodeURIComponent(q);
+
 function toMeta(e, full) {
   const d = e.det || null;
   const m = {
@@ -421,8 +553,53 @@ function toMeta(e, full) {
     if (d.runtime) m.runtime = d.runtime + ' min';
     if (d.cast.length) m.cast = d.cast;
     if (d.director.length) m.director = d.director;
+    if (d.writers && d.writers.length) m.writer = d.writers;
     if (d.released) m.released = new Date(d.released).toISOString();
     if (d.tagline) m.slogan = d.tagline;
+    if (d.countries && d.countries.length) m.country = d.countries.join(', ');
+    const langName = ISO_LANG[d.lang] || '';
+    if (langName) m.language = langName;
+    const om = d.omdb || {};
+    if (om.awards) m.awards = om.awards;
+    // facts line (always visible in the description)
+    const cert = d.cert || om.rated || '';
+    const f = [];
+    if (cert) f.push('Rated ' + cert);
+    if (d.status && d.status !== 'Released') f.push(d.status);
+    if (d.released) f.push((e.type === 'series' ? 'First aired ' : 'Released ') + fmtDate(d.released));
+    if (d.countries && d.countries.length) f.push(d.countries.slice(0, 2).join(', '));
+    if (langName) f.push('Language: ' + langName);
+    if (d.runtime) f.push(d.runtime + ' min');
+    if (om.rt) f.push('Rotten Tomatoes ' + om.rt);
+    if (om.mc) f.push('Metacritic ' + om.mc);
+    const extra = [];
+    if (f.length) extra.push(f.join(' · '));
+    if (om.awards) extra.push('Awards: ' + om.awards);
+    if (d.studios && d.studios.length) extra.push('Studio: ' + d.studios.join(', ') + (d.networks && d.networks.length ? ' · Network: ' + d.networks.join(', ') : ''));
+    if (extra.length) m.description = (m.description || '') + '\n\n' + extra.join('\n');
+    // cast row: the director comes first
+    const castRow = [];
+    (d.directorFull || []).slice(0, 1).forEach((c) => castRow.push({ name: c[0], character: 'Director', photo: c[1] ? 'https://image.tmdb.org/t/p/w185' + c[1] : undefined }));
+    (d.castFull || []).forEach((c) => castRow.push({ name: c[0], character: c[1] || undefined, photo: c[2] ? 'https://image.tmdb.org/t/p/w185' + c[2] : undefined }));
+    if (castRow.length) m.app_extras = { cast: castRow };
+    // trailers, teasers, clips, featurettes
+    if (d.videos && d.videos.length) {
+      m.trailers = d.videos.map((v) => ({ source: v[0], type: v[1] === 'Trailer' ? 'Trailer' : 'Clip' }));
+      m.trailerStreams = d.videos.map((v) => ({ title: v[1] + (v[2] ? ': ' + v[2] : ''), ytId: v[0] }));
+    } else if (d.trailers && d.trailers.length) {
+      m.trailers = d.trailers.map((k) => ({ source: k, type: 'Trailer' }));
+      m.trailerStreams = d.trailers.map((k) => ({ title: 'Trailer', ytId: k }));
+    }
+    // clickable tags: each opens a search in your library
+    const links = [];
+    d.cast.slice(0, 8).forEach((n) => links.push({ name: n, category: 'Cast', url: srch(n) }));
+    d.director.forEach((n) => links.push({ name: n, category: 'Director', url: srch(n) }));
+    (d.writers || []).forEach((n) => links.push({ name: n, category: 'Writer', url: srch(n) }));
+    d.genres.forEach((n) => links.push({ name: n, category: 'Genres', url: srch(n) }));
+    (d.studios || []).forEach((n) => links.push({ name: n, category: 'Studio', url: srch(n) }));
+    if (d.collection) links.push({ name: d.collection.name, category: 'Collection', url: srch(d.collection.name) });
+    similarOf(e).forEach((x) => links.push({ name: x.name, category: 'More like this', url: 'stremio:///detail/' + x.type + '/' + x.id }));
+    if (links.length) m.links = links;
   }
   return m;
 }
@@ -441,8 +618,62 @@ function catalog(type, id, extra) {
   return { metas: items.slice(skip, skip + CFG.pageSize).map((e) => toMeta(e)) };
 }
 
+// which episodes of each season are on the server, compared with TMDB
+function availability(e, videos) {
+  const want = e && e.det && e.det.seasons;
+  if (!want || !videos || !videos.length) return null;
+  const have = {};
+  videos.forEach((v) => { (have[v.season] = have[v.season] || {})[v.episode] = 1; });
+  const parts = []; let complete = true;
+  Object.keys(want).map(Number).sort((a, b) => a - b).forEach((sn) => {
+    const n = want[sn], h = have[sn] || {};
+    const miss = [];
+    for (let k = 1; k <= Math.min(n, 300); k++) if (!h[k]) miss.push(k);
+    if (miss.length) complete = false;
+    const got = n - miss.length;
+    let t = 'S' + sn + ' ' + got + '/' + n;
+    if (miss.length && miss.length < n) {
+      const r = []; let a = miss[0], b = a;
+      for (let q = 1; q <= miss.length; q++) { if (miss[q] === b + 1) { b = miss[q]; continue; } r.push(a === b ? 'E' + a : 'E' + a + '-' + b); a = miss[q]; b = a; }
+      t += ' (missing ' + r.slice(0, 4).join(', ') + (r.length > 4 ? '...' : '') + ')';
+    } else if (miss.length === n) t = 'S' + sn + ' not on server';
+    parts.push(t);
+  });
+  if (!parts.length) return null;
+  return { complete, text: (complete ? 'Complete series. ' : 'Not complete. ') + 'On your server: ' + parts.slice(0, 8).join(' | ') + (parts.length > 8 ? ' ...' : '') };
+}
+
 // episode names, descriptions and pictures from TMDB
 const seasonCache = new Map();
+// which audio languages and subtitle files exist on the server for this title (read from the stream files already exported)
+function serverSummary(outDir, e, videos) {
+  try {
+    const files = [];
+    if (e.type === 'movie') files.push(path.join(outDir, 'stream', 'movie', e.id + '.json'));
+    else {
+      const seen = {};
+      (videos || []).forEach((v) => { if (!seen[v.season] && Object.keys(seen).length < 4) { seen[v.season] = 1; files.push(path.join(outDir, 'stream', 'series', v.id + '.json')); } });
+    }
+    const aud = [], subs = []; let named = false;
+    files.forEach((f) => {
+      if (!fs.existsSync(f)) return;
+      (JSON.parse(fs.readFileSync(f, 'utf8')).streams || []).forEach((st) => {
+        const lines = String(st.name || '').split('\n');
+        const a = lines[lines.length - 1];
+        if (a && a !== 'Original audio' && lines.length > 1) {
+          if (/\(per name\)/.test(a)) named = true;
+          a.replace(/\((?:dub|per name)\)/g, '').split('+').map((x) => x.trim()).filter(Boolean).forEach((l) => { if (aud.indexOf(l) < 0) aud.push(l); });
+        }
+        (st.subtitles || []).forEach((sb) => { const n = ISO3[sb.lang] || sb.lang; if (subs.indexOf(n) < 0) subs.push(n); });
+      });
+    });
+    const parts = [];
+    if (aud.length) parts.push('Audio: ' + aud.join(', ') + (named ? ' (from file names)' : ''));
+    if (subs.length) parts.push('Subtitle files: ' + subs.join(', '));
+    return parts.length ? 'On your server — ' + parts.join(' · ') : '';
+  } catch (err) { return ''; }
+}
+
 async function enrichVideos(m, e) {
   if (!e.tid || !CFG.tmdbKey || !m.videos || !m.videos.length) return;
   const seasons = Array.from(new Set(m.videos.map((v) => v.season)));
@@ -485,6 +716,8 @@ async function meta(type, id) {
     });
     m.videos.sort((a, b) => a.season - b.season || a.episode - b.episode);
     await enrichVideos(m, e);
+    const av = availability(e, m.videos);
+    if (av) { e.complete = av.complete ? 1 : 0; m.description = (m.description || '') + '\n\n' + av.text; }
   }
   return { meta: m };
 }
@@ -505,8 +738,43 @@ function fileInfo(file) {
   else if (/dvdrip/i.test(f)) src = 'DVDRip';
   else if (/hdcam|(^|[^a-z])cam([^a-z]|$)/i.test(f)) src = 'CAM';
   const codec = /x265|hevc|h[ .]?265/i.test(f) ? 'HEVC' : /x264|h[ .]?264|avc/i.test(f) ? 'x264' : '';
-  const hdr = /hdr|dolby[ ._-]?vision/i.test(f) ? 'HDR' : '';
+  const hdrList = [];
+  if (/dolby[ ._-]?vision|(^|[^a-z])dv([^a-z]|$)|dovi/i.test(f)) hdrList.push('Dolby Vision');
+  if (/hdr10\+|hdr10plus/i.test(f)) hdrList.push('HDR10+'); else if (/hdr/i.test(f)) hdrList.push('HDR');
+  if (/atmos/i.test(f)) hdrList.push('Atmos');
+  if (/imax/i.test(f)) hdrList.push('IMAX');
+  const hdr = hdrList.join(' · ');
   return { res, src, codec, hdr, rank: { '2160p': 4, '1080p': 3, '720p': 2, '480p': 1 }[res] || 0 };
+}
+
+// ---------- audio language of each file ----------
+const ISO_LANG = { en: 'English', hi: 'Hindi', bn: 'Bengali', ta: 'Tamil', te: 'Telugu', ml: 'Malayalam', kn: 'Kannada', ko: 'Korean', tr: 'Turkish', ja: 'Japanese', zh: 'Chinese', ur: 'Urdu', pa: 'Punjabi', mr: 'Marathi', es: 'Spanish', fr: 'French', de: 'German', it: 'Italian', ru: 'Russian', th: 'Thai', ar: 'Arabic', id: 'Indonesian', pt: 'Portuguese' };
+const FOLDER_LANG = { Hollywood: 'English', English: 'English', Animation: 'English', Bollywood: 'Hindi', Hindi: 'Hindi', Indian_Bangla: 'Bengali', Korean: 'Korean', Turkish: 'Turkish', Animes: 'Japanese' };
+const AUDIO_WORDS = [['Hindi', 'hindi|hin'], ['English', 'english|eng'], ['Bengali', 'bengali|bangla|bangali'], ['Tamil', 'tamil'], ['Telugu', 'telugu'], ['Malayalam', 'malayalam'], ['Kannada', 'kannada'], ['Korean', 'korean'], ['Urdu', 'urdu'], ['Turkish', 'turkish'], ['Japanese', 'japanese'], ['Chinese', 'chinese|mandarin'], ['Spanish', 'spanish'], ['French', 'french'], ['Punjabi', 'punjabi']];
+function originLang(e) {
+  const l = e && e.det && e.det.lang;
+  return (l && ISO_LANG[l]) || (e && FOLDER_LANG[e.cat]) || '';
+}
+function audioInfo(file, e, known) {
+  let f = ' ' + safeDecode(file).replace(/\.(mkv|mp4|avi|webm|ts|mov)$/i, '').replace(/[._\-+,&()\[\]{}]+/g, ' ').toLowerCase() + ' ';
+  f = f.replace(/\b(?:(?:english|eng|hindi|hin|bangla|bengali|arabic|multi)\s+)?(?:e\s?)?subs?(?:titles?)?\b/g, ' ');   // "English ESubs" are subtitles, not audio
+  const tags = [];
+  AUDIO_WORDS.forEach(([n, re]) => { if (new RegExp('\\b(?:' + re + ')\\b').test(f)) tags.push(n); });
+  const origin = originLang(e);
+  const audio = tags.slice();
+  if (/\b(?:dual|multi)\b/.test(f)) [origin, 'Hindi'].forEach((l) => { if (l && audio.indexOf(l) < 0) audio.push(l); });
+  const named = audio.length > 0;                            // the file name claims a language
+  if (known && known.length) { audio.length = 0; known.forEach((l) => audio.push(l)); }   // real tracks found by "probe" win
+  else if (!audio.length && origin) audio.push(origin);     // no language in the name: the original audio
+  const dub = /\bdub(?:bed)?\b/.test(f) || (!!origin && audio.length > 0 && audio.indexOf(origin) < 0);
+  return { audio, origin, dub, named: named && !(known && known.length) };
+}
+function labelStream(file, sizeText, e, url) {
+  const i = fileInfo(file), a = audioInfo(file, e, url ? audioFor(url) : null);
+  const top = [i.res, sizeText].filter(Boolean).join(' \u00b7 ');
+  const au = a.audio.length ? a.audio.join(' + ') + (a.dub ? ' (dub)' : '') + (a.named ? ' (per name)' : '') : 'Original audio';
+  const note = [a.origin && a.audio.length && a.audio.indexOf(a.origin) < 0 ? 'Original: ' + a.origin : '', i.src, i.codec, i.hdr].filter(Boolean).join(' \u00b7 ');
+  return { name: 'ISP Server' + (top ? '\n' + top : '') + '\n' + au, title: file + (note ? '\n' + note : '') };
 }
 
 async function streams(type, rawId) {
@@ -523,13 +791,7 @@ async function streams(type, rawId) {
   rows.sort((a, b) => b.i.rank - a.i.rank || b.size - a.size);   // best quality first
   return {
     streams: rows.slice(0, 15).map(({ x, i, size }) => {
-      const top = [i.res, fmtSize(size)].filter(Boolean).join(' · ');
-      const more = [i.src, i.codec, i.hdr].filter(Boolean).join(' · ');
-      const st = {
-        name: 'ISP Server' + (top ? '\n' + top : ''),
-        title: x.file + (more ? '\n' + more : ''),
-        url: x.url
-      };
+      const st = Object.assign({}, labelStream(x.file, fmtSize(size), e, x.url), { url: x.url });
       if (x.subs && x.subs.length) st.subtitles = x.subs;
       return st;
     })
@@ -558,14 +820,18 @@ const server = http.createServer(async (req, res) => {
 });
 
 async function exportSite(outDir) {
+  tidMap = null;
+  const fullIndex = index;   // the whole list, even when only some folders or years are exported
   // optional: CATS="Hollywood,Korean" exports only those folders (smaller, faster)
   const only = (process.env.CATS || '').split(',').map((x) => x.trim()).filter(Boolean);
   if (only.length) { index = index.filter((e) => only.indexOf(e.cat) >= 0); console.log('Only these folders: ' + only.join(', ') + ' (' + index.length + ' titles)'); }
   // optional: MIN_YEAR=2018 handles only titles from that year on (much faster)
   const minYear = parseInt(process.env.MIN_YEAR || '0', 10);
   const allIndex = index;
-  const todoSet = minYear ? new Set(index.filter((e) => (parseInt(e.year, 10) || 0) >= minYear).map((e) => e.id)) : null;
-  if (todoSet) console.log('Only titles from ' + minYear + ' on: ' + todoSet.size + ' of ' + index.length);
+  const maxYear = parseInt(process.env.MAX_YEAR || '0', 10);   // optional: MAX_YEAR=2024 stops at that year
+  const inRange = (e) => { const y = parseInt(e.year, 10) || 0; return y >= minYear && (!maxYear || y <= maxYear); };
+  const todoSet = (minYear || maxYear) ? new Set(index.filter(inRange).map((e) => e.id)) : null;
+  if (todoSet) console.log('Only titles from ' + (minYear || 'the start') + (maxYear ? ' to ' + maxYear : ' on') + ': ' + todoSet.size + ' of ' + index.length);
   const w = (rel, obj) => {
     const f = path.join(outDir, rel);
     fs.mkdirSync(path.dirname(f), { recursive: true });
@@ -587,8 +853,16 @@ async function exportSite(outDir) {
       w(rel, { metas });
     }
   }
-  // list of every title, for the search service
-  w('search-index.json', index.map((e) => [e.id, e.type, e.name, e.year || '', String(e.poster || '').replace('https://image.tmdb.org/t/p/w342', ''), e.cat, e.det && e.det.rating ? +e.det.rating : 0, e.det ? e.det.genres.join('|') : '', e.tid || 0, e.added || 0]));
+  // list of every title, for the search service on Vercel
+  const writeSearch = () => w('search-index.json', fullIndex.map((e) => [
+    e.id, e.type, e.name, e.year || '', String(e.poster || '').replace('https://image.tmdb.org/t/p/w342', ''), e.cat,
+    e.det && e.det.rating ? +e.det.rating : 0, e.det ? e.det.genres.join('|') : '', e.tid || 0, e.added || 0,
+    e.det && e.det.alt ? e.det.alt.join(' | ') : '', e.det && e.det.collection ? e.det.collection.name : '', e.det ? e.det.runtime || 0 : 0,
+    e.complete === undefined ? '' : e.complete,
+    e.det ? (e.det.directorFull || []).map((c) => c[0]).concat((e.det.castFull || []).slice(0, 5).map((c) => c[0])).join(' | ') : '',
+    e.det && e.det.imdb ? e.det.imdb : ''
+  ]));
+  writeSearch();
   console.log('Catalog pages written. Now reading every title for episodes and files...');
   let i = 0, done = 0;
   const total = todoSet ? todoSet.size : index.length, t0 = Date.now();
@@ -619,6 +893,12 @@ async function exportSite(outDir) {
           if (j && j.meta) {
             Object.assign(j.meta, toMeta(e, true));
             if (e.type === 'series' && e.tid && j.meta.videos && !j.meta.videos.some((v) => v.thumbnail || v.overview)) await enrichVideos(j.meta, e);
+            if (e.type === 'series') {
+              const av = availability(e, j.meta.videos);
+              if (av) { e.complete = av.complete ? 1 : 0; j.meta.description = (j.meta.description || '') + '\n\n' + av.text; }
+            }
+            const ss = serverSummary(outDir, e, j.meta.videos);
+            if (ss) j.meta.description = (j.meta.description || '') + '\n\n' + ss;
             fs.writeFileSync(mf, JSON.stringify(j));
           }
         } catch (err) {}
@@ -632,12 +912,16 @@ async function exportSite(outDir) {
           for (const v of (m.meta.videos || [])) w('stream/series/' + v.id + '.json', await streams('series', v.id));
           showCache.delete(e.id);
         }
+        const ss2 = serverSummary(outDir, e, m.meta.videos);
+        if (ss2) { m.meta.description = (m.meta.description || '') + '\n\n' + ss2; w('meta/' + e.type + '/' + e.id + '.json', m); }
       } catch (err) { console.log('skipped ' + e.name + ': ' + (err.message || err)); }
       done++;
       if (done % 25 === 0) { const el = (Date.now() - t0) / 1000; console.log(done + ' / ' + total + ' titles done, about ' + Math.round((total - done) * el / done / 60) + ' minutes left'); }
     }
   }
   await Promise.all(Array.from({ length: CFG.parallel }, one));
+  writeSearch();
+  index = fullIndex; save();
   console.log('Finished. ' + total + ' titles written to ' + outDir);
 }
 
@@ -660,6 +944,106 @@ if (process.argv[2] === 'posters') {
     console.log('Finished. Posters found: ' + found + ' of ' + todo.length);
     process.exit(0);
   })();
+} else if (process.argv[2] === 'omdb') {
+  // Rotten Tomatoes, Metacritic, awards and age rating from OMDb. Needs a free key from omdbapi.com (about 1000 titles a day).
+  const key = process.env.OMDB_KEY;
+  if (!key) { console.log('Put your key first, like this:  OMDB_KEY=yourkey node dhaka-addon.js omdb'); process.exit(1); }
+  loadIndex();
+  const limit = parseInt(process.env.LIMIT || '900', 10);
+  const todo = index.filter((e) => e.det && e.det.imdb && !e.det.omdb)
+    .sort((a, b) => (parseInt(b.year, 10) || 0) - (parseInt(a.year, 10) || 0)).slice(0, limit);
+  (async () => {
+    console.log('Titles to look up today: ' + todo.length);
+    let i = 0, done = 0, stop = false;
+    await Promise.all(Array.from({ length: 4 }, async () => {
+      while (i < todo.length && !stop) {
+        const e = todo[i++];
+        const j = await getJson('https://www.omdbapi.com/?apikey=' + key + '&i=' + e.det.imdb);
+        if (!j) continue;
+        if (j.Response === 'False') {
+          if (/limit|invalid api key/i.test(j.Error || '')) { stop = true; console.log('OMDb says: ' + j.Error); break; }
+          e.det.omdb = {}; continue;
+        }
+        const rt = (j.Ratings || []).find((r) => r.Source === 'Rotten Tomatoes');
+        e.det.omdb = {
+          rt: rt ? rt.Value : '',
+          mc: j.Metascore && j.Metascore !== 'N/A' ? j.Metascore : '',
+          awards: j.Awards && j.Awards !== 'N/A' ? j.Awards : '',
+          rated: j.Rated && !/N\/A|Not Rated|Unrated/i.test(j.Rated) ? j.Rated : ''
+        };
+        done++;
+        if (done % 100 === 0) { save(); console.log(done + ' done'); }
+      }
+    }));
+    save();
+    console.log('Saved ' + done + ' titles.' + (stop ? ' The daily limit was reached. Run it again tomorrow to continue.' : '') + ' Now run the export.');
+    process.exit(0);
+  })();
+} else if (process.argv[2] === 'probe') {
+  // reads the real audio tracks of the videos (needs ffprobe: pkg install ffmpeg). MIN_YEAR / MAX_YEAR choose the titles.
+  loadIndex();
+  const minY = parseInt(process.env.MIN_YEAR || '0', 10), maxY = parseInt(process.env.MAX_YEAR || '0', 10);
+  const titles = index.filter((e) => { const y = parseInt(e.year, 10) || 0; return y >= minY && (!maxY || y <= maxY); });
+  (async () => {
+    if (!(await haveFfprobe())) { console.log('ffprobe was not found. Run:  pkg install ffmpeg   and then try again.'); process.exit(1); }
+    console.log('Titles in range: ' + titles.length + ' of ' + index.length);
+    await probeTitles(titles);
+    console.log('Finished. Now run the relabel command.');
+    process.exit(0);
+  })();
+} else if (process.argv[2] === 'details') {
+  // fills in cast photos, trailers, franchise, seasons and original language for titles that already have a TMDB match
+  loadIndex();
+  (async () => {
+    const todo = index.filter((e) => e.tid && (process.env.FORCE || !e.det || e.det.v !== 3));
+    console.log('Titles to fill in: ' + todo.length + ' of ' + index.length);
+    let i = 0, done = 0; const t0 = Date.now();
+    await Promise.all(Array.from({ length: 10 }, async () => {
+      while (i < todo.length) {
+        const e = todo[i++];
+        await fetchDetails(e, e.type === 'series' ? 'tv' : 'movie', e.tid);
+        done++;
+        if (done % 250 === 0) {
+          save();
+          const el = (Date.now() - t0) / 1000;
+          console.log(done + ' / ' + todo.length + ' done, about ' + Math.round((todo.length - done) * el / done / 60) + ' minutes left');
+        }
+      }
+    }));
+    save();
+    console.log('Finished. Now run the export.');
+    process.exit(0);
+  })();
+} else if (process.argv[2] === 'relabel') {
+  // rewrites the audio / quality text of every stream file, using only the files already exported (no server needed)
+  const out = process.argv[3] || 'site';
+  loadIndex();
+  let n = 0, changed = 0;
+  for (const kind of ['movie', 'series']) {
+    const dir = path.join(out, 'stream', kind);
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith('.json')) continue;
+      const parts = f.replace(/\.json$/, '').split('.');
+      const e = byId[parts[0] + '.' + parts[1]];
+      try {
+        const fp = path.join(dir, f);
+        const j = JSON.parse(fs.readFileSync(fp, 'utf8'));
+        let c = false;
+        (j.streams || []).forEach((st) => {
+          const file = String(st.title || '').split('\n')[0];
+          const size = (String(st.name || '').match(/\d+(?:\.\d+)? (?:GB|MB)/) || [''])[0];
+          const lab = labelStream(file, size, e, st.url);
+          if (lab.name !== st.name || lab.title !== st.title) { st.name = lab.name; st.title = lab.title; c = true; }
+        });
+        if (c) { fs.writeFileSync(fp, JSON.stringify(j)); changed++; }
+      } catch (err) {}
+      n++;
+      if (n % 5000 === 0) console.log(n + ' stream files checked');
+    }
+  }
+  console.log('Finished. ' + n + ' stream files checked, ' + changed + ' changed.');
+  process.exit(0);
 } else if (process.argv[2] === 'update') {
   // one command: look for new titles, export them, and upload to GitHub
   const out = process.argv[3] || 'site';
@@ -669,6 +1053,10 @@ if (process.argv[2] === 'posters') {
     await buildIndex(true);
     console.log('Titles in list: ' + index.length + '. New since last time: ' + (state.newCount || 0));
     if (state.error) console.log('Note: ' + state.error);
+    if (state.newCount && await haveFfprobe()) {
+      console.log('Checking the audio tracks of the new titles...');
+      await probeTitles(index.filter((e) => e.added && Date.now() - e.added < 6 * 3600 * 1000));
+    }
     await exportSite(out);
     if (process.argv[4] !== 'nopush') {
       const { execSync } = require('child_process');
