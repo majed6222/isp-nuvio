@@ -777,7 +777,11 @@ function labelStream(file, sizeText, e, url) {
   const top = [i.res, sizeText].filter(Boolean).join(' \u00b7 ');
   const au = a.audio.length ? a.audio.join(' + ') + (a.dub ? ' (dub)' : '') + (a.named ? ' (per name)' : '') : 'Original audio';
   const note = [a.origin && a.audio.length && a.audio.indexOf(a.origin) < 0 ? 'Original: ' + a.origin : '', i.src, i.codec, i.hdr].filter(Boolean).join(' \u00b7 ');
-  return { name: 'ISP Server' + (top ? '\n' + top : '') + '\n' + au, title: file + (note ? '\n' + note : '') };
+  const om = (e && e.det && e.det.omdb) || {};
+  const score = [om.rt ? 'Rotten Tomatoes ' + om.rt : '', om.mc ? 'Metacritic ' + om.mc : ''].filter(Boolean).join(' \u00b7 ');
+  const award = om.awards ? String(om.awards).slice(0, 70) : '';
+  const extra = [score, award].filter(Boolean).join('\n');
+  return { name: 'ISP Server' + (top ? '\n' + top : '') + '\n' + au, title: file + (note ? '\n' + note : '') + (extra ? '\n' + extra : '') };
 }
 
 async function streams(type, rawId) {
