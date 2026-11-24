@@ -7,6 +7,7 @@ const PAGES = (process.env.PAGES_URL || 'https://majed6222.github.io/isp-nuvio')
 const TMDB_KEY = process.env.TMDB_KEY || '18c5a939865f2d093d1bcda9b234b58b';
 const POSTER_PREFIX = 'https://image.tmdb.org/t/p/w342';
 const PAGE = 100;
+const RPDB_KEY = process.env.RPDB_KEY || '';   // optional: ratings printed on the posters (ratingposterdb.com)
 
 let cache = { at: 0, items: null };
 
@@ -28,19 +29,23 @@ async function loadIndex() {
     return {
       id: x[0], type: x[1], name: x[2], year: x[3], poster: x[4], cat: x[5],
       rating: x[6] || 0, genres, tid: x[8] || 0, added: x[9] || 0,
-      alt: x[10] || '', coll: x[11] || '', runtime: x[12] || 0, complete: x[13],
+      alt: x[10] || '', coll: x[11] || '', runtime: x[12] || 0, complete: x[13], people: x[14] || '', imdb: x[15] || '',
       key: nameKey, nameTokens: nameKey.split(' ').concat(norm(x[10] || '').split(' ')).filter(Boolean),
-      full: norm(x[2] + ' ' + x[3] + ' ' + genres.join(' ') + ' ' + catLabel(x[5]) + ' ' + (x[10] || '') + ' ' + (x[11] || ''))
+      full: norm(x[2] + ' ' + x[3] + ' ' + genres.join(' ') + ' ' + catLabel(x[5]) + ' ' + (x[10] || '') + ' ' + (x[11] || '') + ' ' + (x[14] || ''))
     };
   });
-  cache = { at: Date.now(), items };
+  const byId = new Map();
+  items.forEach((e) => byId.set(e.id, e));
+  cache = { at: Date.now(), items, byId };
   return items;
 }
+
+const posterOf = (e) => (RPDB_KEY && e.imdb) ? 'https://api.ratingposterdb.com/' + RPDB_KEY + '/imdb/poster-default/' + e.imdb + '.jpg?fallback=true' : (e.poster ? POSTER_PREFIX + e.poster : undefined);
 
 function toMeta(e) {
   return {
     id: e.id, type: e.type, name: e.name,
-    poster: e.poster ? POSTER_PREFIX + e.poster : undefined,
+    poster: posterOf(e),
     releaseInfo: e.year || undefined,
     genres: e.genres.concat([catLabel(e.cat)]),
     imdbRating: e.rating ? String(e.rating.toFixed ? e.rating.toFixed(1) : e.rating) : undefined
@@ -174,6 +179,42 @@ async function subtitles(type, rawId) {
   } catch (e) { return { subtitles: [] }; }
 }
 
+// ---------- live details that change over time (next episode of a running series) ----------
+const liveCache = new Map();
+async function liveText(tid) {
+  const c = liveCache.get(tid);
+  if (c && Date.now() - c.at < 6 * 3600 * 1000) return c.text;
+  let text = '';
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 4000);
+    const r = await fetch('https://api.themoviedb.org/3/tv/' + tid + '?api_key=' + TMDB_KEY, { signal: ctl.signal });
+    clearTimeout(t);
+    const j = await r.json();
+    const day = (d) => new Date(d + 'T00:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+    if (j.next_episode_to_air && j.next_episode_to_air.air_date) {
+      const n = j.next_episode_to_air;
+      text = 'Next episode: S' + n.season_number + 'E' + n.episode_number + ' on ' + day(n.air_date) + '.';
+    } else if (j.status === 'Returning Series') text = 'Returning series. The next episode date has not been announced.';
+    else if (j.status === 'Ended' || j.status === 'Canceled') text = 'This series has ended.';
+  } catch (e) {}
+  liveCache.set(tid, { at: Date.now(), text });
+  return text;
+}
+
+async function decorate(seg, j) {
+  const items = await loadIndex();
+  const byId = cache.byId;
+  if (RPDB_KEY) {
+    (j.metas || []).forEach((m) => { const it = byId.get(m.id); if (it && it.imdb) m.poster = posterOf(it); });
+    if (j.meta) { const it = byId.get(j.meta.id); if (it && it.imdb) j.meta.poster = posterOf(it); }
+  }
+  if (seg[0] === 'meta' && seg[1] === 'series' && j.meta) {
+    const it = byId.get(j.meta.id);
+    if (it && it.tid) { const t = await liveText(it.tid); if (t) j.meta.description = (j.meta.description || '') + '\n\n' + t; }
+  }
+}
+
 async function manifest() {
   const r = await fetch(PAGES + '/manifest.json');
   if (!r.ok) throw new Error('manifest.json not found (' + r.status + ')');
@@ -198,7 +239,7 @@ async function manifest() {
       { type: 'series', id: 'dm-search-series', name: 'Dhaka Search', extra: [{ name: 'search', isRequired: true }] }
     ]);
   m.resources = ['catalog', 'meta', 'stream', 'subtitles'];
-  m.version = '3.2.0';
+  m.version = '3.3.0';
   m.description = 'Every movie and series on server1.dhakamovie.com, with search, trending, top rated and genres.';
   return m;
 }
@@ -254,7 +295,11 @@ module.exports = async (req, res) => {
       if (r.status === 404) {
         return send(200, seg[0] === 'catalog' ? { metas: [] } : seg[0] === 'meta' ? { meta: null } : { streams: [] }, 60);
       }
-      return send(200, await r.text(), 3600);
+      let body = await r.text();
+      if (RPDB_KEY || (seg[0] === 'meta' && seg[1] === 'series')) {
+        try { const j = JSON.parse(body); await decorate(seg, j); body = JSON.stringify(j); } catch (e) {}
+      }
+      return send(200, body, seg[0] === 'meta' && seg[1] === 'series' ? 600 : 3600);
     }
     send(404, { error: 'not found' });
   } catch (e) {
