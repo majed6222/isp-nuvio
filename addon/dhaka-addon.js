@@ -549,6 +549,9 @@ function toMeta(e, full) {
     genres: (d && d.genres.length ? d.genres : []).concat([catLabel(e.cat)]),
     imdbRating: d && d.rating ? d.rating : undefined
   };
+  // lets Nuvio tie this title to TMDB / IMDb and use its own rich page (certification, networks, more like this...)
+  if (full && d && d.imdb) m.imdb_id = d.imdb;
+  if (full && e.tid) { m.moviedb_id = e.tid; m.tmdbId = e.tid; }
   if (full && d) {
     if (d.runtime) m.runtime = d.runtime + ' min';
     if (d.cast.length) m.cast = d.cast;
