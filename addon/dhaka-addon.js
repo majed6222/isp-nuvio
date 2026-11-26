@@ -95,6 +95,7 @@ function cleanName(raw) {
   s = s.replace(/\(\s*(?:TV[ -]?Series|Series|Movie)?[ -]*(?:19|20)\d\d[^)]*\)/ig, ' ');
   s = s.replace(/[._]+/g, ' ').replace(/-{2,}/g, ' ').replace(/\s-\s/g, ' - ');
   s = s.replace(/-/g, ' ').replace(/\s+/g, ' ').trim();
+  { const t = s.replace(/\s+(?:2160p|1080p|720p|480p|4k|hdcam|hdts|camrip|dvdscr|predvd|hdrip|webrip|web ?dl|bluray|brrip|bdrip|hevc|x264|x265|rip)\b.*$/i, '').trim(); if (t.length >= 2) s = t; }
   // a year stuck on the end of the folder name ("... Unit 1999") is shown separately
   const m = s.match(/^(.+\s)((?:19|20)\d\d)$/);
   if (m && +m[2] <= new Date().getFullYear() && m[1].trim().split(' ').length > 1) s = m[1].trim();
@@ -147,13 +148,17 @@ async function crawlRoot(type, rootPath, add, known) {
 // ---------- posters ----------
 const normT = (t) => String(t || '').toLowerCase().replace(/['\u2019`]/g, '').replace(/&/g, ' ').replace(/[^a-z0-9]+/g, ' ')
   .split(' ').filter((w) => w && w !== 'and' && w !== 'the').join(' ');
-const TAGS = /\b(2160p|1080p|720p|480p|4k|uhd|hdr|bluray|brrip|bdrip|webrip|web[ -]?dl|hdrip|hdtv|dvdrip|x264|x265|hevc|h264|10bit|hindi|english|bangla|dual|audio|dubbed|esubs?|amzn|nf|complete|season)\b.*$/i;
+const TAGS = /\b(2160p|1080p|720p|480p|360p|4k|uhd|hdr|bluray|blu-ray|brrip|bdrip|webrip|web[ -]?dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|hdts|hdtc|camrip|cam|predvd|pre-dvd|hq|rip|x264|x265|hevc|h264|h265|10bit|hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|dual|multi|audio|dubbed|esubs?|subs?|amzn|nf|complete|season|uncut|unrated|proper|repack|extended|remastered|imax)\b.*$/i;
 
 function searchName(e) {
-  let n = String(e.name || '').replace(TAGS, ' ').trim();
+  let n = String(e.name || '');
+  // cut the junk tags, but never when the tag is the very first word (a title can start with "Cam" or "Rip")
+  const m = TAGS.exec(n);
+  if (m && m.index > 0) n = n.slice(0, m.index);
+  n = n.replace(/[\[\(\{].*$/, ' ').trim();           // anything after an opening bracket
   const noYear = n.replace(/\b(19|20)\d\d\b.*$/, '').trim();
   if (noYear) n = noYear;
-  return n;
+  return n.trim();
 }
 async function getJson(url) {
   try { const r = await fetch(url); return await r.json(); } catch (err) { return null; }
@@ -190,6 +195,7 @@ async function fetchDetails(e, kind, id) {
   const prevOmdb = e.det && e.det.omdb;
   e.det = {
     v: 3,
+    title,
     rating: d.vote_average ? d.vote_average.toFixed(1) : '',
     genres: (d.genres || []).map((g) => g.name).slice(0, 4),
     runtime: d.runtime || (d.episode_run_time && d.episode_run_time[0]) || 0,
@@ -542,8 +548,9 @@ const srch = (q) => 'stremio:///search?search=' + encodeURIComponent(q);
 
 function toMeta(e, full) {
   const d = e.det || null;
+  const junk = d && d.title && searchName(e) !== e.name;      // the folder name has tags like HDCAM: show the real title instead
   const m = {
-    id: e.id, type: e.type, name: e.name,
+    id: e.id, type: e.type, name: junk ? d.title : e.name,
     poster: e.poster || undefined, background: e.background || undefined,
     description: e.description || ('Folder: ' + e.cat), releaseInfo: e.year || undefined,
     genres: (d && d.genres.length ? d.genres : []).concat([catLabel(e.cat)]),
@@ -864,7 +871,7 @@ async function exportSite(outDir) {
   const writeSearch = () => w('search-index.json', fullIndex.map((e) => [
     e.id, e.type, e.name, e.year || '', String(e.poster || '').replace('https://image.tmdb.org/t/p/w342', ''), e.cat,
     e.det && e.det.rating ? +e.det.rating : 0, e.det ? e.det.genres.join('|') : '', e.tid || 0, e.added || 0,
-    e.det && e.det.alt ? e.det.alt.join(' | ') : '', e.det && e.det.collection ? e.det.collection.name : '', e.det ? e.det.runtime || 0 : 0,
+    e.det ? (e.det.alt || []).concat(e.det.title && searchName(e) !== e.name ? [e.det.title] : []).join(' | ') : '', e.det && e.det.collection ? e.det.collection.name : '', e.det ? e.det.runtime || 0 : 0,
     e.complete === undefined ? '' : e.complete,
     e.det ? (e.det.directorFull || []).map((c) => c[0]).concat((e.det.castFull || []).slice(0, 5).map((c) => c[0])).join(' | ') : '',
     e.det && e.det.imdb ? e.det.imdb : ''
@@ -941,6 +948,7 @@ if (process.argv[2] === 'posters') {
     await Promise.all(Array.from({ length: 8 }, async () => {
       while (i < todo.length) {
         const e = todo[i++];
+        e.name = cleanName(lastSeg(e.url));
         await tmdbPoster(e);
         if (e.poster) found++;
         done++;
@@ -951,6 +959,18 @@ if (process.argv[2] === 'posters') {
     console.log('Finished. Posters found: ' + found + ' of ' + todo.length);
     process.exit(0);
   })();
+} else if (process.argv[2] === 'stats') {
+  // how many titles still have no poster / no details, and which ones
+  loadIndex();
+  const noPoster = index.filter((e) => !e.poster);
+  const noDet = index.filter((e) => e.poster && (!e.det || e.det.v !== 3));
+  console.log('Titles: ' + index.length);
+  console.log('Without a poster: ' + noPoster.length);
+  console.log('With a poster but without full details: ' + noDet.length);
+  try { fs.writeFileSync(path.join(path.dirname(CFG.indexFile), 'dhaka-unmatched.txt'), noPoster.map((e) => e.cat + ' | ' + e.year + ' | ' + e.name).join('\n')); console.log('Full list saved in dhaka-unmatched.txt'); } catch (err) {}
+  console.log('First 25 without a poster:');
+  noPoster.slice(0, 25).forEach((e) => console.log('  ' + e.cat + ' | ' + e.year + ' | ' + e.name));
+  process.exit(0);
 } else if (process.argv[2] === 'omdb') {
   // Rotten Tomatoes, Metacritic, awards and age rating from OMDb. Needs a free key from omdbapi.com (about 1000 titles a day).
   const key = process.env.OMDB_KEY;
