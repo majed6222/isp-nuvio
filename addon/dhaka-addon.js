@@ -146,9 +146,10 @@ async function crawlRoot(type, rootPath, add, known) {
 }
 
 // ---------- posters ----------
+const ROMAN = { ii: '2', iii: '3', iv: '4', vi: '6', vii: '7', viii: '8', ix: '9' };
 const normT = (t) => String(t || '').toLowerCase().replace(/['\u2019`]/g, '').replace(/&/g, ' ').replace(/[^a-z0-9]+/g, ' ')
-  .split(' ').filter((w) => w && w !== 'and' && w !== 'the').join(' ');
-const TAGS = /\b(2160p|1080p|720p|480p|360p|4k|uhd|hdr|bluray|blu-ray|brrip|bdrip|webrip|web[ -]?dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|hdts|hdtc|camrip|cam|predvd|pre-dvd|hq|rip|x264|x265|hevc|h264|h265|10bit|hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|dual|multi|audio|dubbed|esubs?|subs?|amzn|nf|complete|season|uncut|unrated|proper|repack|extended|remastered|imax)\b.*$/i;
+  .split(' ').filter((w) => w && w !== 'and' && w !== 'the').map((w) => ROMAN[w] || w).join(' ');
+const TAGS = /\b(2160p|1080p|720p|480p|360p|4k|uhd|hdr|bluray|blu-ray|brrip|bdrip|webrip|web[ -]?dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|hdts|hdtc|camrip|cam|predvd|pre-dvd|hq|rip|x264|x265|hevc|h264|h265|10bit|hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|dual|multi|audio|dubbed|esubs?|subs?|amzn|nf|complete|season|uncut|unrated|proper|repack|extended|remastered|imax|directors?|director's|final cut|theatrical|dc)\b.*$/i;
 
 function searchName(e) {
   let n = String(e.name || '');
@@ -160,8 +161,18 @@ function searchName(e) {
   if (noYear) n = noYear;
   return n.trim();
 }
+const NET = { fail: 0, ok: 0, last: '' };
 async function getJson(url) {
-  try { const r = await fetch(url); return await r.json(); } catch (err) { return null; }
+  for (let t = 0; t < 3; t++) {
+    try {
+      const r = await fetch(url);
+      if (r.status === 429) { NET.last = 'HTTP 429 (too many requests)'; await new Promise((x) => setTimeout(x, 1500 * (t + 1))); continue; }
+      const j = await r.json();
+      if (!r.ok) { NET.fail++; NET.last = 'HTTP ' + r.status + ' ' + String(j && j.status_message || '').slice(0, 80); return null; }
+      NET.ok++; return j;
+    } catch (err) { NET.fail++; NET.last = String(err && (err.cause && err.cause.code || err.message) || err).slice(0, 120); await new Promise((x) => setTimeout(x, 500)); }
+  }
+  return null;
 }
 const yearNum = (d) => parseInt(String(d || '').slice(0, 4), 10) || 0;
 
@@ -226,30 +237,71 @@ async function fetchDetails(e, kind, id) {
 }
 
 // A poster is used only when the title matches and the year fits. No poster is better than a wrong one.
+function loadFixes() {
+  try { return JSON.parse(fs.readFileSync(path.join(path.dirname(CFG.indexFile), 'dhaka-fixes.json'), 'utf8')); } catch (err) { return {}; }
+}
+function fixFor(e) {
+  const f = loadFixes(), n = String(e.name || '').toLowerCase(), u = String(e.url || '').toLowerCase();
+  for (const k of Object.keys(f)) { const kk = k.toLowerCase(); if (n === kk || n.indexOf(kk + ' ') === 0 || (kk.length > 3 && (n.indexOf(kk) >= 0 || u.indexOf(encodeURI(kk)) >= 0))) return f[k]; }
+  return null;
+}
+const lev = (a, b) => { const m = a.length, n = b.length; if (!m || !n) return Math.max(m, n); let prev = Array.from({ length: n + 1 }, (_, j) => j); for (let i = 1; i <= m; i++) { const cur = [i]; for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; } return prev[n]; };
+const overlap = (a, b) => { const x = a.split(' '), y = b.split(' '); const sy = new Set(y); const hit = x.filter((w) => sy.has(w)).length; return Math.min(x.length, y.length) >= 2 ? hit / Math.min(x.length, y.length) : 0; };
+const sim = (a, b) => { const x = a.split(' '), y = b.split(' '); const sy = new Set(y); const hit = x.filter((w) => sy.has(w)).length; return hit / Math.max(x.length, y.length); };
 async function tmdbPoster(e) {
   e.posterTried = true;
   e.poster = ''; e.background = ''; e.description = ''; e.tid = 0; e.det = null;
   if (!CFG.tmdbKey) return;
-  const kind = e.type === 'series' ? 'tv' : 'movie';
+  let kind = e.type === 'series' ? 'tv' : 'movie';
+  const fx = fixFor(e);
+  if (fx && fx.tmdb) {
+    if (fx.kind) kind = fx.kind;
+    const j = await getJson('https://api.themoviedb.org/3/' + kind + '/' + fx.tmdb + '?api_key=' + CFG.tmdbKey);
+    if (j && j.id) {
+      e.poster = j.poster_path ? 'https://image.tmdb.org/t/p/w342' + j.poster_path : '';
+      e.background = j.backdrop_path ? 'https://image.tmdb.org/t/p/w780' + j.backdrop_path : '';
+      e.description = j.overview || '';
+      e.tid = j.id;
+      await fetchDetails(e, kind, j.id);
+      return;
+    }
+  }
   const q = searchName(e), want = normT(q), wy = parseInt(e.year, 10) || 0;
   if (!want) return;
-  async function search(withYear) {
+  // the name with its numbers kept ("Batwara 1947"), and the name without a trailing year
+  let full = String(e.name || '');
+  const m0 = TAGS.exec(full); if (m0 && m0.index > 0) full = full.slice(0, m0.index);
+  full = full.replace(/[\[\(\{].*$/, ' ').replace(/\b(19|20)\d\d\s*$/, (x) => (wy && parseInt(x, 10) === wy ? '' : x)).trim();
+  const queries = Array.from(new Set([full, q].filter((x) => x && normT(x))));
+  async function search(query, withYear) {
     const yr = withYear && wy ? '&' + (kind === 'tv' ? 'first_air_date_year=' : 'year=') + wy : '';
-    const j = await getJson('https://api.themoviedb.org/3/search/' + kind + '?api_key=' + CFG.tmdbKey + '&query=' + encodeURIComponent(q) + yr);
+    const j = await getJson('https://api.themoviedb.org/3/search/' + kind + '?api_key=' + CFG.tmdbKey + '&query=' + encodeURIComponent(query) + yr);
     const res = (j && j.results) || [];
-    for (const r of res.slice(0, 8)) {
+    const w = normT(query);
+    let best = null, bs = 0;
+    for (const r of res.slice(0, 10)) {
       if (!r.poster_path) continue;
       const ry = yearNum(r.release_date || r.first_air_date);
       if (wy && ry && Math.abs(ry - wy) > 1) continue;
       const names = [r.title, r.name, r.original_title, r.original_name].map(normT).filter(Boolean);
-      const exact = names.some((t) => t === want);
-      const prefix = want.split(' ').length >= 2 && ry === wy && names.some((t) => t.indexOf(want + ' ') === 0);
-      if (exact || prefix) return r;
+      let sc = 0;
+      if (names.some((t) => t === w)) sc = 1;
+      else if (w.split(' ').length >= 2 && ry === wy && names.some((t) => t.indexOf(w + ' ') === 0 || w.indexOf(t + ' ') === 0)) sc = 0.9;
+      else if (wy && ry && Math.abs(ry - wy) <= 1) {
+        const s2 = Math.max.apply(null, names.map((t) => sim(w, t)));
+        const s3 = Math.max.apply(null, names.map((t) => overlap(w, t)));
+        const s4 = Math.max.apply(null, names.map((t) => 1 - lev(w, t) / Math.max(w.length, t.length)));
+        if (w.split(' ').length >= 2 && s2 >= 0.75) sc = 0.8 * s2;
+        else if (ry === wy && s3 >= 0.8) sc = 0.7 * s3;
+        else if (ry === wy && w.length >= 5 && s4 >= 0.8) sc = 0.7 * s4;
+      }
+      if (sc > bs) { bs = sc; best = r; }
     }
-    return null;
+    return best;
   }
-  let h = await search(true);
-  if (!h && wy) h = await search(false);
+  let h = null;
+  for (const qq of queries) { h = await search(qq, true); if (h) break; }
+  if (!h && wy) for (const qq of queries) { h = await search(qq, false); if (h) break; }
   if (h) {
     e.poster = 'https://image.tmdb.org/t/p/w342' + h.poster_path;
     e.background = h.backdrop_path ? 'https://image.tmdb.org/t/p/w780' + h.backdrop_path : '';
@@ -261,7 +313,7 @@ async function tmdbPoster(e) {
   // second source for series: TVmaze (no key needed)
   if (e.type === 'series') {
     const j = await getJson('https://api.tvmaze.com/search/shows?q=' + encodeURIComponent(q));
-    for (const it of (j || []).slice(0, 5)) {
+    for (const it of (Array.isArray(j) ? j : []).slice(0, 5)) {
       const sh = it && it.show;
       if (!sh || !sh.image) continue;
       const ry = yearNum(sh.premiered);
@@ -939,7 +991,18 @@ async function exportSite(outDir) {
   console.log('Finished. ' + total + ' titles written to ' + outDir);
 }
 
-if (process.argv[2] === 'posters') {
+if (process.argv[2] === 'fix') {
+  loadIndex();
+  const key = process.argv[3], id = parseInt(process.argv[4], 10), kd = process.argv[5] === 'tv' ? 'tv' : (process.argv[5] === 'movie' ? 'movie' : '');
+  if (!key || !id) { console.log('Use: node dhaka-addon.js fix "part of folder name" TMDB-number [tv]'); process.exit(0); }
+  const f = loadFixes(); f[key] = { tmdb: id }; if (kd) f[key].kind = kd;
+  fs.writeFileSync(path.join(path.dirname(CFG.indexFile), 'dhaka-fixes.json'), JSON.stringify(f, null, 1));
+  (async () => {
+    const hits = index.filter((e) => fixFor(e));
+    for (const e of hits) { await tmdbPoster(e); console.log((e.poster ? 'OK   ' : 'FAIL ') + e.name); }
+    save(); process.exit(0);
+  })();
+} else if (process.argv[2] === 'posters') {
   loadIndex();
   (async () => {
     const todo = process.argv[3] === 'missing' ? index.filter((e) => !e.poster) : index;
@@ -952,7 +1015,8 @@ if (process.argv[2] === 'posters') {
         await tmdbPoster(e);
         if (e.poster) found++;
         done++;
-        if (done % 500 === 0) { console.log(done + ' / ' + todo.length + ' (' + found + ' posters found)'); save(); }
+        if (done % 500 === 0) { console.log(done + ' / ' + todo.length + ' (' + found + ' posters found; web requests ok ' + NET.ok + ', failed ' + NET.fail + (NET.last ? ', last problem: ' + NET.last : '') + ')'); save(); }
+        if (done === 30 && NET.ok === 0) { console.log('STOP: the movie database did not answer even once. Last problem: ' + NET.last); save(); process.exit(1); }
       }
     }));
     save();
