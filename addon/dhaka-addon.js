@@ -146,9 +146,10 @@ async function crawlRoot(type, rootPath, add, known) {
 }
 
 // ---------- posters ----------
+const ROMAN = { ii: '2', iii: '3', iv: '4', vi: '6', vii: '7', viii: '8', ix: '9' };
 const normT = (t) => String(t || '').toLowerCase().replace(/['\u2019`]/g, '').replace(/&/g, ' ').replace(/[^a-z0-9]+/g, ' ')
-  .split(' ').filter((w) => w && w !== 'and' && w !== 'the').join(' ');
-const TAGS = /\b(2160p|1080p|720p|480p|360p|4k|uhd|hdr|bluray|blu-ray|brrip|bdrip|webrip|web[ -]?dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|hdts|hdtc|camrip|cam|predvd|pre-dvd|hq|rip|x264|x265|hevc|h264|h265|10bit|hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|dual|multi|audio|dubbed|esubs?|subs?|amzn|nf|complete|season|uncut|unrated|proper|repack|extended|remastered|imax)\b.*$/i;
+  .split(' ').filter((w) => w && w !== 'and' && w !== 'the').map((w) => ROMAN[w] || w).join(' ');
+const TAGS = /\b(2160p|1080p|720p|480p|360p|4k|uhd|hdr|bluray|blu-ray|brrip|bdrip|webrip|web[ -]?dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|hdts|hdtc|camrip|cam|predvd|pre-dvd|hq|rip|x264|x265|hevc|h264|h265|10bit|hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|dual|multi|audio|dubbed|esubs?|subs?|amzn|nf|complete|season|uncut|unrated|proper|repack|extended|remastered|imax|directors?|director's|final cut|theatrical|dc)\b.*$/i;
 
 function searchName(e) {
   let n = String(e.name || '');
@@ -234,6 +235,8 @@ function fixFor(e) {
   for (const k of Object.keys(f)) { const kk = k.toLowerCase(); if (n === kk || n.indexOf(kk + ' ') === 0 || (kk.length > 3 && (n.indexOf(kk) >= 0 || u.indexOf(encodeURI(kk)) >= 0))) return f[k]; }
   return null;
 }
+const lev = (a, b) => { const m = a.length, n = b.length; if (!m || !n) return Math.max(m, n); let prev = Array.from({ length: n + 1 }, (_, j) => j); for (let i = 1; i <= m; i++) { const cur = [i]; for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; } return prev[n]; };
+const overlap = (a, b) => { const x = a.split(' '), y = b.split(' '); const sy = new Set(y); const hit = x.filter((w) => sy.has(w)).length; return Math.min(x.length, y.length) >= 2 ? hit / Math.min(x.length, y.length) : 0; };
 const sim = (a, b) => { const x = a.split(' '), y = b.split(' '); const sy = new Set(y); const hit = x.filter((w) => sy.has(w)).length; return hit / Math.max(x.length, y.length); };
 async function tmdbPoster(e) {
   e.posterTried = true;
@@ -274,7 +277,14 @@ async function tmdbPoster(e) {
       let sc = 0;
       if (names.some((t) => t === w)) sc = 1;
       else if (w.split(' ').length >= 2 && ry === wy && names.some((t) => t.indexOf(w + ' ') === 0 || w.indexOf(t + ' ') === 0)) sc = 0.9;
-      else if (w.split(' ').length >= 2 && wy && ry && Math.abs(ry - wy) <= 1) { const s2 = Math.max.apply(null, names.map((t) => sim(w, t))); if (s2 >= 0.75) sc = 0.8 * s2; }
+      else if (wy && ry && Math.abs(ry - wy) <= 1) {
+        const s2 = Math.max.apply(null, names.map((t) => sim(w, t)));
+        const s3 = Math.max.apply(null, names.map((t) => overlap(w, t)));
+        const s4 = Math.max.apply(null, names.map((t) => 1 - lev(w, t) / Math.max(w.length, t.length)));
+        if (w.split(' ').length >= 2 && s2 >= 0.75) sc = 0.8 * s2;
+        else if (ry === wy && s3 >= 0.8) sc = 0.7 * s3;
+        else if (ry === wy && w.length >= 5 && s4 >= 0.8) sc = 0.7 * s4;
+      }
       if (sc > bs) { bs = sc; best = r; }
     }
     return best;
