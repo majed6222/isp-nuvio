@@ -149,7 +149,7 @@ async function crawlRoot(type, rootPath, add, known) {
 const ROMAN = { ii: '2', iii: '3', iv: '4', vi: '6', vii: '7', viii: '8', ix: '9' };
 const normT = (t) => String(t || '').toLowerCase().replace(/['\u2019`]/g, '').replace(/&/g, ' ').replace(/[^a-z0-9]+/g, ' ')
   .split(' ').filter((w) => w && w !== 'and' && w !== 'the').map((w) => ROMAN[w] || w).join(' ');
-const TAGS = /\b(2160p|1080p|720p|480p|360p|4k|uhd|hdr|bluray|blu-ray|brrip|bdrip|webrip|web[ -]?dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|hdts|hdtc|camrip|cam|predvd|pre-dvd|hq|rip|x264|x265|hevc|h264|h265|10bit|hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|dual|multi|audio|dubbed|esubs?|subs?|amzn|nf|complete|season|uncut|unrated|proper|repack|extended|remastered|imax|directors?|director's|final cut|theatrical|dc)\b.*$/i;
+const TAGS = /\b(2160p|1080p|720p|480p|360p|4k|uhd|hdr|bluray|blu-ray|brrip|bdrip|webrip|web[ -]?dl|hdrip|hdtv|dvdrip|dvdscr|hdcam|hdts|hdtc|camrip|cam|predvd|pre-dvd|hq|rip|x264|x265|hevc|h264|h265|10bit|dual|multi|audio|dubbed|esubs?|subs?|amzn|nf|complete|season|uncut|unrated|proper|repack|extended|remastered|imax|directors?|director's|final cut|theatrical|dc)\b.*$/i;
 
 function searchName(e) {
   let n = String(e.name || '');
@@ -272,7 +272,8 @@ async function tmdbPoster(e) {
   let full = String(e.name || '');
   const m0 = TAGS.exec(full); if (m0 && m0.index > 0) full = full.slice(0, m0.index);
   full = full.replace(/[\[\(\{].*$/, ' ').replace(/\b(19|20)\d\d\s*$/, (x) => (wy && parseInt(x, 10) === wy ? '' : x)).trim();
-  const queries = Array.from(new Set([full, q].filter((x) => x && normT(x))));
+  const noLang = full.replace(/(\s+(hindi|english|bangla|bengali|tamil|telugu|malayalam|kannada|korean|urdu|punjabi|marathi|bhojpuri))+\s*$/i, '').trim();
+  const queries = Array.from(new Set([full, q, noLang].filter((x) => x && normT(x))));
   async function search(query, withYear) {
     const yr = withYear && wy ? '&' + (kind === 'tv' ? 'first_air_date_year=' : 'year=') + wy : '';
     const j = await getJson('https://api.themoviedb.org/3/search/' + kind + '?api_key=' + CFG.tmdbKey + '&query=' + encodeURIComponent(query) + yr);
