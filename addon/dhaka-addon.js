@@ -991,7 +991,29 @@ async function exportSite(outDir) {
   console.log('Finished. ' + total + ' titles written to ' + outDir);
 }
 
-if (process.argv[2] === 'fix') {
+if (process.argv[2] === 'why') {
+  loadIndex();
+  const key = String(process.argv[3] || '').toLowerCase();
+  (async () => {
+    const hits = index.filter((e) => String(e.name || '').toLowerCase().indexOf(key) >= 0).slice(0, 3);
+    if (!hits.length) { console.log('No title in the list contains: ' + key); process.exit(0); }
+    for (const e of hits) {
+      console.log('--------');
+      console.log('Folder name : ' + lastSeg(e.url));
+      console.log('Name / year : ' + e.name + ' / ' + e.year + '   type: ' + e.type + '   cat: ' + e.cat);
+      console.log('Search text : ' + searchName(e));
+      console.log('Has poster  : ' + (e.poster ? 'yes' : 'NO') + '   TMDB id: ' + (e.tid || 'none'));
+      const kind = e.type === 'series' ? 'tv' : 'movie';
+      for (const withYear of [true, false]) {
+        const yr = withYear && e.year ? '&' + (kind === 'tv' ? 'first_air_date_year=' : 'year=') + e.year : '';
+        const j = await getJson('https://api.themoviedb.org/3/search/' + kind + '?api_key=' + CFG.tmdbKey + '&query=' + encodeURIComponent(searchName(e)) + yr);
+        console.log('TMDB answer ' + (withYear ? 'with year' : 'without year') + ': ' + (j && j.results ? j.results.length + ' results' : 'NO ANSWER (' + NET.last + ')'));
+        ((j && j.results) || []).slice(0, 4).forEach((r) => console.log('   ' + (r.title || r.name) + ' | ' + (r.release_date || r.first_air_date || '?') + ' | id ' + r.id + ' | poster ' + (r.poster_path ? 'yes' : 'no')));
+      }
+    }
+    process.exit(0);
+  })();
+} else if (process.argv[2] === 'fix') {
   loadIndex();
   const key = process.argv[3], id = parseInt(process.argv[4], 10), kd = process.argv[5] === 'tv' ? 'tv' : (process.argv[5] === 'movie' ? 'movie' : '');
   if (!key || !id) { console.log('Use: node dhaka-addon.js fix "part of folder name" TMDB-number [tv]'); process.exit(0); }
