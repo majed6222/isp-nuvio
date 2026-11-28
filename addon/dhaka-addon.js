@@ -241,8 +241,13 @@ function loadFixes() {
   try { return JSON.parse(fs.readFileSync(path.join(path.dirname(CFG.indexFile), 'dhaka-fixes.json'), 'utf8')); } catch (err) { return {}; }
 }
 function fixFor(e) {
-  const f = loadFixes(), n = String(e.name || '').toLowerCase(), u = String(e.url || '').toLowerCase();
-  for (const k of Object.keys(f)) { const kk = k.toLowerCase(); if (n === kk || n.indexOf(kk + ' ') === 0 || (kk.length > 3 && (n.indexOf(kk) >= 0 || u.indexOf(encodeURI(kk)) >= 0))) return f[k]; }
+  const f = loadFixes(), n = String(e.name || '').toLowerCase().trim();
+  let folder = ''; try { folder = decodeURIComponent(lastSeg(e.url)).toLowerCase().trim(); } catch (err) { folder = String(lastSeg(e.url) || '').toLowerCase(); }
+  for (const k of Object.keys(f)) {
+    let kk = k.toLowerCase().trim();
+    if (kk.slice(-1) === '*') { kk = kk.slice(0, -1).trim(); if (kk && (n.indexOf(kk) === 0 || folder.indexOf(kk) === 0)) return f[k]; }
+    else if (n === kk || folder === kk) return f[k];
+  }
   return null;
 }
 const lev = (a, b) => { const m = a.length, n = b.length; if (!m || !n) return Math.max(m, n); let prev = Array.from({ length: n + 1 }, (_, j) => j); for (let i = 1; i <= m; i++) { const cur = [i]; for (let j = 1; j <= n; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; } return prev[n]; };
@@ -1017,7 +1022,7 @@ if (process.argv[2] === 'why') {
 } else if (process.argv[2] === 'fix') {
   loadIndex();
   const key = process.argv[3], id = parseInt(process.argv[4], 10), kd = process.argv[5] === 'tv' ? 'tv' : (process.argv[5] === 'movie' ? 'movie' : '');
-  if (!key || !id) { console.log('Use: node dhaka-addon.js fix "part of folder name" TMDB-number [tv]'); process.exit(0); }
+  if (!key || !id) { console.log('Use: node dhaka-addon.js fix "exact title name" TMDB-number [tv]   (add * after the name to match every title that starts with it)'); process.exit(0); }
   const f = loadFixes(); f[key] = { tmdb: id }; if (kd) f[key].kind = kd;
   fs.writeFileSync(path.join(path.dirname(CFG.indexFile), 'dhaka-fixes.json'), JSON.stringify(f, null, 1));
   (async () => {
